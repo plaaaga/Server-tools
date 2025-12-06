@@ -1,94 +1,108 @@
 #!/bin/bash
 
-# ╔════════════════════════════════════════════════╗
-#   🧊 Universal SWAP Manager — удобный модуль
-#   Автоматическая установка и настройка swap файла
-# ╚════════════════════════════════════════════════╝
-
 clear
 
-# Проверка root
-if [[ $EUID -ne 0 ]]; then
-  echo "Этот скрипт нужно запускать от root."
-  exit 1
-fi
+# ====== COLORS ======
+GREEN="\e[32m"
+CYAN="\e[36m"
+GRAY="\e[90m"
+RESET="\e[0m"
 
-# Проверка текущего swap
-check_swap() {
-    swapon --show --bytes
-}
-
-# Статус swap в упрощённом виде
-swap_exists() {
-    [[ -n "$(swapon --show --noheadings)" ]]
-}
-
-# Установка параметров swappiness и vfs_cache_pressure
-apply_sysctl_values() {
-    local sw=$1
-    local vfs=$2
-
-    echo "Применение параметров swappiness=$sw, vfs_cache_pressure=$vfs..."
-
-    sysctl vm.swappiness=$sw >/dev/null
-    sysctl vm.vfs_cache_pressure=$vfs >/dev/null
-
-    grep -q "vm.swappiness" /etc/sysctl.conf \
-        && sed -i "s/^vm\.swappiness=.*/vm.swappiness=$sw/" /etc/sysctl.conf \
-        || echo "vm.swappiness=$sw" >> /etc/sysctl.conf
-
-    grep -q "vm.vfs_cache_pressure" /etc/sysctl.conf \
-        && sed -i "s/^vm\.vfs_cache_pressure=.*/vm.vfs_cache_pressure=$vfs/" /etc/sysctl.conf \
-        || echo "vm.vfs_cache_pressure=$vfs" >> /etc/sysctl.conf
-
-    echo "✓ Параметры успешно применены."
-}
-
-# Создание swap-файла
-create_swap() {
+# ====== FUNCTIONS ======
+show_header() {
     clear
-    echo "Создание нового swap файла"
+    echo -e "${CYAN}"
+    echo -e "🧊  Universal SWAP Manager — удобный модуль"
+    echo -e "${RESET}"
 
-    read -rp "Введите размер swap файла в ГБ (например 8): " SIZE
+    echo -e "${GRAY}📌 Информация о системе:${RESET}"
 
-    clear
-    echo "По умолчанию создается swap с параметрами:"
-    echo "  ▸ swappiness: 10"
-    echo "  ▸ vfs_cache_pressure: 50"
-    read -rp "Использовать значения по умолчанию? (Y/n): " use_default
+    # RAM info
+    RAM_TOTAL=$(free -h | awk '/Mem:/ {print $2}')
+    echo -e "  ▸ RAM: ${CYAN}$RAM_TOTAL${RESET}"
 
-    if [[ "$use_default" =~ ^[Yy]$ || -z "$use_default" ]]; then
-        SW=10
-        VFS=50
+    # Disk info
+    DISK_TOTAL=$(df -h / | awk 'NR==2 {print $2}')
+    echo -e "  ▸ Disk /: ${CYAN}$DISK_TOTAL${RESET}"
+
+    # Swap info
+    if swapon --show | grep -q "swapfile"; then
+        SWAP_SIZE=$(swapon --show --bytes | awk 'NR==2 {printf "%.1fG", $3/1024/1024/1024}')
+        echo -e "  ▸ Swap: ${CYAN}$SWAP_SIZE${RESET}"
     else
-        clear
-        echo "Пояснение параметров:"
-        echo "  ▸ swappiness — как активно будет использоваться swap"
-        echo "       Значения:"
-        echo "       0–10: Почти не использовать swap (только при реальном OOM)"
-        echo "       10–20: Оптимально для серверов и нод (минимум лагов)"
-        echo "       30–40: Нормально для десктопов (баланс)"
-        echo "       60: Значение по умолчанию в Ubuntu"
-        echo "       80–100: Агрессивное свопирование (маленькая RAM)"
-        echo
-        echo "  ▸ vfs_cache_pressure — как долго хранится файловый кэш в RAM"
-        echo "       Значения:"
-        echo "       1–50: Кэш держится дольше, лучше для серверов/нод"
-        echo "       100: Значение по умолчанию в Ubuntu"
-        echo "       150–200: Сильно ускоренное очищение кэша"
-        echo
-
-        read -rp "Введите значение swappiness (0–100): " SW
-        read -rp "Введите значение vfs_cache_pressure (1–200): " VFS
+        echo -e "  ▸ Swap: ${CYAN}не найден${RESET}"
     fi
 
+    # sysctl parameters
+    SWAPPINESS=$(sysctl -n vm.swappiness 2>/dev/null)
+    CACHE_PRESSURE=$(sysctl -n vm.vfs_cache_pressure 2>/dev/null)
+    echo -e "  ▸ swappiness: ${CYAN}${SWAPPINESS}${RESET}"
+    echo -e "  ▸ vfs_cache_pressure: ${CYAN}${CACHE_PRESSURE}${RESET}"
+
+    echo ""
+}
+
+apply_sysctl() {
+    sed -i '/vm.swappiness/d' /etc/sysctl.conf
+    sed -i '/vm.vfs_cache_pressure/d' /etc/sysctl.conf
+
+    echo "vm.swappiness = $1" >> /etc/sysctl.conf
+    echo "vm.vfs_cache_pressure = $2" >> /etc/sysctl.conf
+
+    sysctl -p >/dev/null 2>&1
+}
+
+show_params_help() {
     clear
-    echo "Создаю swap размером ${SIZE}G..."
+    echo -e "${CYAN}Пояснение параметров:${RESET}"
+    echo ""
+    echo "  ▸ swappiness — как активно будет использоваться swap"
+    echo "       Значения:"
+    echo "       0–10: Почти не использовать swap (OOM protection)"
+    echo "       10–20: Оптимально для серверов и нод"
+    echo "       30–40: Нормально для десктопов"
+    echo "       60: Значение по умолчанию в Ubuntu"
+    echo "       80–100: Очень агрессивное свопирование"
+    echo ""
+    echo "  ▸ vfs_cache_pressure — как долго хранится файловый кэш"
+    echo "       Значения:"
+    echo "       1–50: Кэш хранится дольше (лучше для серверов/нод)"
+    echo "       100: Значение по умолчанию в Ubuntu"
+    echo "       150–200: Быстрое очищение кэша"
+    echo ""
+}
 
-    swapoff -a 2>/dev/null
-    rm -f /swapfile
+create_or_recreate_swap() {
+    clear
+    echo -ne "Введите размер swap файла в ГБ (например 8): "
+    read SWAP_GB
 
-    fallocate -l ${SIZE}G /swapfile || dd if=/dev/zero of=/swapfile bs=1G count=$SIZE
+    if swapon --show | grep -q "swapfile"; then
+        echo -e "${GRAY}Отключаю и удаляю существующий swap...${RESET}"
+        swapoff -a
+        rm -f /swapfile
+    fi
+
+    echo ""
+    echo "По умолчанию используются параметры:"
+    echo "  ▸ swappiness: 10"
+    echo "  ▸ vfs_cache_pressure: 50"
+    echo -ne "Использовать значения по умолчанию (10 / 50)? (Y/n): "
+    read DEF
+
+    if [[ "$DEF" =~ ^[Nn]$ ]]; then
+        show_params_help
+        echo -ne "Введите swappiness (0–100): "
+        read SW
+        echo -ne "Введите vfs_cache_pressure (1–200): "
+        read CP
+    else
+        SW=10
+        CP=50
+    fi
+
+    echo -e "${GRAY}Создание нового swap...${RESET}"
+    dd if=/dev/zero of=/swapfile bs=1G count=$SWAP_GB status=none
     chmod 600 /swapfile
     mkswap /swapfile >/dev/null
     swapon /swapfile
@@ -97,76 +111,76 @@ create_swap() {
         echo "/swapfile none swap sw 0 0" >> /etc/fstab
     fi
 
-    apply_sysctl_values $SW $VFS
+    apply_sysctl $SW $CP
 
     clear
-    echo "✓ Новый swap успешно создан!"
-    check_swap
+    echo -e "${GREEN}✔ Новый swap (${SWAP_GB}G) создан и активирован.${RESET}"
+    echo -e "${GREEN}✔ Параметры применены: swappiness=${SW}, vfs_cache_pressure=${CP}${RESET}"
 }
 
-# Удаление swap
-delete_swap() {
-    clear
-    echo "Удаление swap..."
+tune_existing_params() {
+    show_params_help
 
-    swapoff -a
-    sed -i "/\/swapfile/d" /etc/fstab
-    rm -f /swapfile
+    echo "Выбор:"
+    echo "1) Применить значения по умолчанию (10 / 50) — рекомендовано для нод"
+    echo "2) Ввести свои значения"
+    echo "3) Отмена"
+    echo -ne "Выбор [1-3]: "
+    read CH
 
-    clear
-    echo "✓ Swap отключён и удалён."
-}
-
-# Меню, когда swap существует
-menu_existing_swap() {
-    clear
-    echo "✔ Обнаружен активный swap."
-    check_swap
-    echo
-    echo "Выберите действие:"
-    echo "1) Оставить существующий swap"
-    echo "2) Настроить swappiness / vfs_cache_pressure"
-    echo "3) Пересоздать swap"
-    echo "4) Удалить swap"
-    echo "5) Выход"
-    read -rp "Ваш выбор [1-5]: " CH
-
-    case $CH in
-        1) clear; echo "Ничего не изменено."; exit 0 ;;
-        2)
+    case "$CH" in
+        1)
+            apply_sysctl 10 50
             clear
-            echo "Введите новые значения:"
-            read -rp "swappiness (0–100): " SW
-            read -rp "vfs_cache_pressure (1–200): " VFS
-            apply_sysctl_values $SW $VFS
-            exit 0
+            echo -e "${GREEN}✔ Параметры применены: swappiness=10, vfs_cache_pressure=50${RESET}"
         ;;
-        3) create_swap ;;
-        4) delete_swap ;;
-        5) exit 0 ;;
-        *) menu_existing_swap ;;
+        2)
+            echo -ne "Введите swappiness (0–100): "
+            read SW
+            echo -ne "Введите vfs_cache_pressure (1–200): "
+            read CP
+            apply_sysctl $SW $CP
+            clear
+            echo -e "${GREEN}✔ Параметры применены: swappiness=${SW}, vfs_cache_pressure=${CP}${RESET}"
+        ;;
+        3)
+            clear
+        ;;
     esac
 }
 
-# Меню, когда swap отсутствует
-menu_no_swap() {
-    clear
-    echo "Swap не найден."
+# ====== MAIN MENU ======
+show_header
+
+if ! swapon --show | grep -q "swapfile"; then
+    echo -e "${CYAN}Swap не найден.${RESET}"
+    echo ""
     echo "Выберите действие:"
-    echo "1) Создать новый /swapfile"
+    echo "1) Создать swap"
     echo "2) Выход"
-    read -rp "Выбор [1-2]: " CH
+    echo -ne "Выбор [1-2]: "
+    read CH
 
-    case $CH in
-        1) create_swap ;;
-        2) exit 0 ;;
-        *) menu_no_swap ;;
+    case "$CH" in
+        1) create_or_recreate_swap ;;
+        *) clear ;;
     esac
-}
 
-# Логика запуска
-if swap_exists; then
-    menu_existing_swap
-else
-    menu_no_swap
+    exit 0
 fi
+
+# If swap exists
+echo "Выберите действие:"
+echo "1) Оставить существующий swap"
+echo "2) Настроить параметры (swappiness / cache_pressure)"
+echo "3) Создать / пересоздать swap"
+echo "4) Выход"
+echo -ne "Выбор [1-4]: "
+read CH
+
+case "$CH" in
+    1) clear ;;
+    2) tune_existing_params ;;
+    3) create_or_recreate_swap ;;
+    4) clear ;;
+esac
