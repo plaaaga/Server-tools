@@ -1,23 +1,19 @@
 #!/usr/bin/env bash
 # ======================================================
-#  🧊 Universal SWAP Manager — удобный модуль
+#  🧊 Universal SWAP Manager — удобный модуль (fixed)
 #  Поддержка: Ubuntu, Debian
-#  - Показ системы (CPU / RAM / Disk / SWAP / параметры)
-#  - Настройка swappiness и vfs_cache_pressure
-#  - Создать / Пересоздать swap с красивым progress-bar
 # ======================================================
 
 set -o errexit
 set -o nounset
 set -o pipefail
 
-# ---------------- config ----------------
 SWAPFILE="/swapfile"
 SYSCTL_CONF="/etc/sysctl.d/99-swap-tuning.conf"
-BLOCK_SIZE_BYTES=$((4 * 1024 * 1024))   # 4 MiB block
+BLOCK_SIZE_BYTES=$((4 * 1024 * 1024))   # 4 MiB
 BAR_WIDTH=30
 
-# colors (may be absent or minimal in some terminals)
+# colors
 CLR_BOLD="\e[1m"
 CLR_RESET="\e[0m"
 CLR_CYAN="\e[36m"
@@ -25,15 +21,14 @@ CLR_GREEN="\e[32m"
 CLR_YELLOW="\e[33m"
 CLR_RED="\e[31m"
 
-# require root
+# run as root
 if [[ $EUID -ne 0 ]]; then
-  echo "Этот скрипт нужно запускать от root (sudo)."
+  echo "Запустите скрипт от root (sudo)."
   exit 1
 fi
 
 # ---------- helpers ----------
 human_readable_bytes() {
-  # input: bytes -> nice string like 7.7G
   awk -v b="$1" 'BEGIN{
     if (b < 1024) { printf "%dB", b; exit }
     if (b < 1024*1024) { printf "%.1fK", b/1024; exit }
@@ -53,9 +48,7 @@ get_vfs_cache_pressure() { sysctl -n vm.vfs_cache_pressure 2>/dev/null || echo "
 
 get_cpu_info() {
   local cores=$(nproc --all 2>/dev/null || echo "?")
-  # average MHz across CPUs (if available)
   local mhz=$(awk '/cpu MHz/ {sum+=$4; n++} END{if(n>0) printf "%.1f", sum/n/1000; else print "?"}' /proc/cpuinfo 2>/dev/null)
-  # print like: "4 vCore @ 2.9 GHz"
   if [[ "$mhz" == "?" ]]; then
     echo "${cores} vCore"
   else
@@ -63,41 +56,34 @@ get_cpu_info() {
   fi
 }
 
-# ---------- show system info ----------
+# ---------- system info ----------
 show_system_info() {
   clear
   echo -e "${CLR_CYAN}${CLR_BOLD}🧊  Universal SWAP Manager — удобный модуль${CLR_RESET}"
   echo ""
   echo -e "${CLR_CYAN}📌 Информация о системе:${CLR_RESET}"
-  echo -n "  ▸ CPU (процессор):      "
-  echo -e "${CLR_YELLOW}$(get_cpu_info)${CLR_RESET}"
-  echo -n "  ▸ RAM (объём оперативной памяти):  "
-  echo -e "${CLR_YELLOW}$(get_total_ram_gb) GiB (доступно: $(get_avail_ram_gb) GiB)${CLR_RESET}"
-  echo -n "  ▸ Disk / (объём диска): "
-  echo -e "${CLR_YELLOW}$(get_root_disk_total) (свободно: $(get_root_disk_avail))${CLR_RESET}"
+  echo -n "  ▸ CPU (процессор):      "; echo -e "${CLR_YELLOW}$(get_cpu_info)${CLR_RESET}"
+  echo -n "  ▸ RAM (объём оперативной памяти):  "; echo -e "${CLR_YELLOW}$(get_total_ram_gb) GiB (доступно: $(get_avail_ram_gb) GiB)${CLR_RESET}"
+  echo -n "  ▸ Disk / (объём диска): "; echo -e "${CLR_YELLOW}$(get_root_disk_total) (свободно: $(get_root_disk_avail))${CLR_RESET}"
 
   local swap_bytes
   swap_bytes=$(get_swap_bytes)
   if [[ -n "$swap_bytes" && "$swap_bytes" -gt 0 ]]; then
-    echo -n "  ▸ SWAP (объём файла подкачки): "
-    echo -e "${CLR_YELLOW}$(human_readable_bytes "$swap_bytes")${CLR_RESET}"
+    echo -n "  ▸ SWAP (объём файла подкачки): "; echo -e "${CLR_YELLOW}$(human_readable_bytes "$swap_bytes")${CLR_RESET}"
   else
-    echo -n "  ▸ SWAP (объём файла подкачки): "
-    echo -e "${CLR_YELLOW}не найден${CLR_RESET}"
+    echo -n "  ▸ SWAP (объём файла подкачки): "; echo -e "${CLR_YELLOW}не найден${CLR_RESET}"
   fi
 
-  echo -n "  ▸ swappiness*:          "
-  echo -e "${CLR_YELLOW}$(get_swappiness)${CLR_RESET}"
-  echo -n "  ▸ vfs_cache_pressure**: "
-  echo -e "${CLR_YELLOW}$(get_vfs_cache_pressure)${CLR_RESET}"
+  echo -n "  ▸ swappiness*:          "; echo -e "${CLR_YELLOW}$(get_swappiness)${CLR_RESET}"
+  echo -n "  ▸ vfs_cache_pressure**: "; echo -e "${CLR_YELLOW}$(get_vfs_cache_pressure)${CLR_RESET}"
   echo ""
   echo -e "* swappiness — параметр, отвечающий за то, как активно будет использоваться swap (связан с файлом подкачки)"
   echo -e "** vfs_cache_pressure — параметр, отвечающий за то, как долго хранится файловый кэш; работает всегда и влияет на RAM независимо от swap"
   echo ""
 }
 
-# ---------- sysctl apply ----------
-save_and_apply_sysctl() {
+# ---------- apply sysctl ----------
+apply_sysctl_and_save() {
   local sw="$1"; local vfs="$2"
   cat > "$SYSCTL_CONF" <<EOF
 # Applied by swap.sh
@@ -107,9 +93,8 @@ EOF
   sysctl -p "$SYSCTL_CONF" >/dev/null 2>&1 || true
 }
 
-# ---------- safe fstab ----------
+# ---------- fstab helpers ----------
 ensure_fstab_entry() {
-  # remove duplicates then append
   sed -i "\|$SWAPFILE|d" /etc/fstab 2>/dev/null || true
   echo "$SWAPFILE none swap sw 0 0" >> /etc/fstab
 }
@@ -117,106 +102,80 @@ remove_swap_from_fstab() {
   sed -i "\|$SWAPFILE|d" /etc/fstab 2>/dev/null || true
 }
 
-# ---------- progress bar ----------
-print_progress_bar_line() {
-  # args: written_bytes total_bytes elapsed_seconds
-  local written=$1 total=$2 elapsed=$3
-  local percent=0
-  if (( total > 0 )); then
-    percent=$(( written * 100 / total ))
-  fi
-  local filled=$(( percent * BAR_WIDTH / 100 ))
-  local empty=$(( BAR_WIDTH - filled ))
-  local bar=""
-  for ((i=0;i<filled;i++)); do bar+="#"; done
-  for ((i=0;i<empty;i++)); do bar+="-"; done
-
-  # speed in MB/s, avoid division by zero
-  local speed=0
-  if (( elapsed > 0 )); then
-    speed=$(( written / 1024 / 1024 / elapsed ))
-  fi
-
-  local written_hr total_hr
-  written_hr=$(human_readable_bytes "$written")
-  total_hr=$(human_readable_bytes "$total")
-
-  printf "\r[%s] %3d%%  (%s / %s) | %s MB/s | прошло %s сек" "$bar" "$percent" "$written_hr" "$total_hr" "$speed" "$elapsed"
-}
-
-# ---------- create swap with manual blocks and progress ----------
-create_swap_with_progress() {
-  local size_gb="$1"
-  local total_bytes=$(( size_gb * 1024 * 1024 * 1024 ))
-  local block=$BLOCK_SIZE_BYTES
-  local blocks=$(( total_bytes / block ))
-  if (( blocks <= 0 )); then
-    echo "Неверный размер"
-    return 1
-  fi
-
-  # ensure previous swapped off and file removed
-  swapoff -a 2>/dev/null || true
-  remove_swap_from_fstab
-  rm -f "$SWAPFILE" 2>/dev/null || true
-
-  # create empty file and set perm
-  : > "$SWAPFILE"
-  chmod 600 "$SWAPFILE"
-
-  local written=0
-  local start_ts=$(date +%s)
-  local last_update_ts=$start_ts
-
-  # write blocks with dd (append) — dd status suppressed, update once per second
-  for ((i=1;i<=blocks;i++)); do
-    dd if=/dev/zero bs="$block" count=1 of="$SWAPFILE" oflag=append conv=notrunc status=none 2>/dev/null || {
-      echo -e "\nОшибка записи блока. Прерывание."
-      return 1
-    }
-    written=$(( written + block ))
-    local now_ts=$(date +%s)
-    if (( now_ts > last_update_ts )); then
-      last_update_ts=$now_ts
-      local elapsed=$(( now_ts - start_ts ))
-      print_progress_bar_line "$written" "$total_bytes" "$elapsed"
-    fi
-  done
-
-  # remainder
-  local remainder=$(( total_bytes - written ))
-  if (( remainder > 0 )); then
-    dd if=/dev/zero bs=1 count="$remainder" of="$SWAPFILE" oflag=append conv=notrunc status=none 2>/dev/null || true
-    written=$(( written + remainder ))
-  fi
-
-  # finalize: mkswap and swapon
-  printf "\n"
-  mkswap "$SWAPFILE" >/dev/null 2>&1 || { echo "mkswap failed"; return 1; }
-  swapon "$SWAPFILE" >/dev/null 2>&1 || { echo "swapon failed"; return 1; }
-
-  ensure_fstab_entry
-
-  return 0
-}
-
-# ---------- input validation ----------
+# ---------- validate integer ----------
 read_integer() {
-  local prompt="$1"
-  local min=${2:-0}
-  local max=${3:-999999}
-  local val
+  local prompt="$1"; local min=${2:-0}; local max=${3:-999999}; local val
   while true; do
     read -rp "$prompt" val
     if [[ "$val" =~ ^[0-9]+$ ]] && (( val >= min && val <= max )); then
-      echo "$val"
-      return 0
+      echo "$val"; return 0
     fi
     echo "Ошибка: введите целое число от $min до $max."
   done
 }
 
-# ---------- Main menus ----------
+# ---------- check free space ----------
+check_free_space_bytes() {
+  # returns available bytes on root '/'
+  df --output=avail -B1 / | awk 'NR==2{print $1}'
+}
+
+# ---------- create swap using dd status=progress ----------
+create_swap_dd_progress() {
+  local size_gb="$1"
+  local total_bytes=$(( size_gb * 1024 * 1024 * 1024 ))
+
+  # check disk free
+  local avail_bytes
+  avail_bytes=$(check_free_space_bytes)
+  if [[ -z "$avail_bytes" ]]; then
+    echo "Не удалось определить свободное место на диске. Продолжение рискованно. Подтвердите вручную."
+  fi
+
+  # require at least total_bytes + 100MB margin
+  local margin=$((100 * 1024 * 1024))
+  if (( avail_bytes < total_bytes + margin )); then
+    echo -e "${CLR_RED}Недостаточно свободного места на разделе / для создания swap ${size_gb}G.${CLR_RESET}"
+    echo "Свободно: $(human_readable_bytes "$avail_bytes"), требуется примерно: $(human_readable_bytes $((total_bytes + margin)))"
+    read -rp "Продолжить всё равно? (y/N): " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+      echo "Отмена."
+      return 1
+    fi
+  fi
+
+  # disable/remove existing
+  swapoff -a 2>/dev/null || true
+  remove_swap_from_fstab
+  rm -f "$SWAPFILE" 2>/dev/null || true
+
+  # Create using dd with status=progress
+  local count=$(( size_gb * 256 ))   # because bs=4M -> 4MiB * 256 = 1GiB
+  echo ""
+  echo -e "${CLR_YELLOW}Запуск dd: создаём /swapfile ${size_gb}G (bs=4M count=${count}).${CLR_RESET}"
+  echo -e "Вы увидите прогресс в формате dd (bytes copied, скорость)."
+
+  # Run dd — status=progress prints to stderr by default
+  if ! dd if=/dev/zero of="$SWAPFILE" bs=4M count="$count" status=progress conv=fsync 2>&1; then
+    echo -e "${CLR_RED}dd вернул ошибку при записи файла.${CLR_RESET}"
+    return 1
+  fi
+
+  chmod 600 "$SWAPFILE"
+  if ! mkswap "$SWAPFILE" >/dev/null 2>&1; then
+    echo -e "${CLR_RED}mkswap не удался.${CLR_RESET}"
+    return 1
+  fi
+  if ! swapon "$SWAPFILE" >/dev/null 2>&1; then
+    echo -e "${CLR_RED}swapon не удался.${CLR_RESET}"
+    return 1
+  fi
+
+  ensure_fstab_entry
+  return 0
+}
+
+# ---------- Menus ----------
 menu_when_swap_exists() {
   while true; do
     echo ""
@@ -228,9 +187,7 @@ menu_when_swap_exists() {
     read -rp "Выбор [1-4]: " CH
     case "$CH" in
       1)
-        clear
-        echo "Ничего не изменено. Выход."
-        exit 0
+        clear; echo "Ничего не изменено. Выход."; exit 0
         ;;
       2)
         clear
@@ -258,6 +215,8 @@ menu_when_swap_exists() {
             apply_sysctl_and_save 10 50
             clear
             echo -e "${CLR_GREEN}✔ Параметры применены: swappiness=10, vfs_cache_pressure=50${CLR_RESET}"
+            read -rp "Нажмите Enter чтобы вернуться в меню..."
+            clear
             ;;
           2)
             sw=$(read_integer "Введите swappiness (0–100): " 0 100)
@@ -265,10 +224,11 @@ menu_when_swap_exists() {
             apply_sysctl_and_save "$sw" "$cpv"
             clear
             echo -e "${CLR_GREEN}✔ Параметры применены: swappiness=${sw}, vfs_cache_pressure=${cpv}${CLR_RESET}"
+            read -rp "Нажмите Enter чтобы вернуться в меню..."
+            clear
             ;;
           *)
-            clear
-            echo "Отмена."
+            clear; echo "Отмена."
             ;;
         esac
         ;;
@@ -287,21 +247,22 @@ menu_when_swap_exists() {
         else
           sw=10; cpv=50
         fi
-
         echo -e "${CLR_YELLOW}Начинаю пересоздание swap (${sz}G). Это может занять несколько минут...${CLR_RESET}"
-        if create_swap_with_progress "$sz"; then
+        if create_swap_dd_progress "$sz"; then
           apply_sysctl_and_save "$sw" "$cpv"
           clear
           echo -e "${CLR_GREEN}✔ Swap пересоздан и параметры применены.${CLR_RESET}"
           swapon --show || true
+          read -rp "Нажмите Enter чтобы вернуться в меню..."
+          clear
         else
           echo -e "${CLR_RED}Ошибка при создании swap.${CLR_RESET}"
+          read -rp "Нажмите Enter чтобы вернуться в меню..."
+          clear
         fi
         ;;
       4)
-        clear
-        echo "Выход."
-        exit 0
+        clear; echo "Выход."; exit 0
         ;;
       *)
         echo "Неверный выбор."
@@ -334,19 +295,21 @@ menu_when_no_swap() {
           sw=10; cpv=50
         fi
         echo -e "${CLR_YELLOW}Создание swap файла (${sz}G). Это может занять несколько минут...${CLR_RESET}"
-        if create_swap_with_progress "$sz"; then
+        if create_swap_dd_progress "$sz"; then
           apply_sysctl_and_save "$sw" "$cpv"
           clear
           echo -e "${CLR_GREEN}✔ Swap создан и параметры применены.${CLR_RESET}"
           swapon --show || true
+          read -rp "Нажмите Enter чтобы вернуться в меню..."
+          clear
         else
           echo -e "${CLR_RED}Ошибка при создании swap.${CLR_RESET}"
+          read -rp "Нажмите Enter чтобы вернуться в меню..."
+          clear
         fi
         ;;
       2)
-        clear
-        echo "Выход."
-        exit 0
+        clear; echo "Выход."; exit 0
         ;;
       *)
         echo "Неверный выбор."
@@ -355,9 +318,8 @@ menu_when_no_swap() {
   done
 }
 
-# ---------------- run ----------------
+# ---------- run ----------
 show_system_info
-# determine if swap exists
 swap_bytes=$(get_swap_bytes)
 if [[ -n "$swap_bytes" && "$swap_bytes" -gt 0 ]]; then
   menu_when_swap_exists
