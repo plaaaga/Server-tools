@@ -187,7 +187,7 @@ menu_when_swap_exists() {
     read -rp "Выбор [1-4]: " CH
     case "$CH" in
       1)
-        clear; echo "Ничего не изменено. Выход."; exit 0
+        clear; echo "Ничего не изменено. Осуществлён выход из Universal SWAP Manager"; exit 0
         ;;
       2)
         clear
@@ -214,18 +214,18 @@ menu_when_swap_exists() {
           1)
             apply_sysctl_and_save 10 50
             clear
-            echo -e "${CLR_GREEN}✔ Параметры применены: swappiness=10, vfs_cache_pressure=50${CLR_RESET}"
-            read -rp "Нажмите Enter чтобы вернуться в меню..."
-            clear
+            echo -e "${CLR_GREEN}✔ Применены оптимальные для нод параметры: swappiness=10, vfs_cache_pressure=50${CLR_RESET}"; exit 0
+            # read -rp "Нажмите Enter чтобы вернуться в меню..."
+            # clear
             ;;
           2)
             sw=$(read_integer "Введите swappiness (0–100): " 0 100)
             cpv=$(read_integer "Введите vfs_cache_pressure (1–200): " 1 200)
             apply_sysctl_and_save "$sw" "$cpv"
             clear
-            echo -e "${CLR_GREEN}✔ Параметры применены: swappiness=${sw}, vfs_cache_pressure=${cpv}${CLR_RESET}"
-            read -rp "Нажмите Enter чтобы вернуться в меню..."
-            clear
+            echo -e "${CLR_GREEN}✔ Параметры применены: swappiness=${sw}, vfs_cache_pressure=${cpv}${CLR_RESET}"; exit 0
+            # read -rp "Нажмите Enter чтобы вернуться в меню..."
+            # clear
             ;;
           *)
             clear; echo "Отмена."
@@ -235,7 +235,7 @@ menu_when_swap_exists() {
       3)
         clear
         echo "Пересоздание swap (существующий swap будет удалён)."
-        sz=$(read_integer "Введите размер нового swap в ГБ (например 8): " 1 65536)
+        sz=$(read_integer "Введите размер нового swap в ГБ (например, 8): " 1 65536)
         echo ""
         echo "По умолчанию используются параметры (оптимально для нод):"
         echo "  ▸ swappiness: 10"
@@ -254,8 +254,8 @@ menu_when_swap_exists() {
           echo -e "${CLR_GREEN}✔ Swap пересоздан и параметры применены.${CLR_RESET}"
           swapon --show || true
           exit 0
-          read -rp "Нажмите Enter чтобы вернуться в меню..."
-          clear
+          # read -rp "Нажмите Enter чтобы вернуться в меню..."
+          # clear
         else
           echo -e "${CLR_RED}Ошибка при создании swap.${CLR_RESET}"
           read -rp "Нажмите Enter чтобы вернуться в меню..."
@@ -283,7 +283,7 @@ menu_when_no_swap() {
     case "$ch" in
       1)
         clear
-        sz=$(read_integer "Введите размер swap в ГБ (например 8): " 1 65536)
+        sz=$(read_integer "Введите размер swap в ГБ (например, 8): " 1 65536)
         echo ""
         echo "По умолчанию используются параметры (оптимально для нод):"
         echo "  ▸ swappiness: 10"
@@ -302,8 +302,8 @@ menu_when_no_swap() {
           echo -e "${CLR_GREEN}✔ Swap создан и параметры применены.${CLR_RESET}"
           swapon --show || true
           exit 0
-          read -rp "Нажмите Enter чтобы вернуться в меню..."
-          clear
+          # read -rp "Нажмите Enter чтобы вернуться в меню..."
+          # clear
         else
           echo -e "${CLR_RED}Ошибка при создании swap.${CLR_RESET}"
           read -rp "Нажмите Enter чтобы вернуться в меню..."
