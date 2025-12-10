@@ -29,7 +29,7 @@ _warn() { printf "[WARN] %s\n" "$*"; }
 _err() { printf "[ERROR] %s\n" "$*" >&2; }
 
 #########################
-# Утилиты
+# Проверки окружения
 #########################
 require_root() {
   if [[ $EUID -ne 0 ]]; then
@@ -38,15 +38,36 @@ require_root() {
   fi
 }
 
+require_commands() {
+  local miss=()
+  for cmd in awk df swapon swapoff mkswap dd sed grep findmnt sysctl; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      miss+=("$cmd")
+    fi
+  done
+  if ((${#miss[@]} > 0)); then
+    _err "Не найдены нужные команды: ${miss[*]}. Установите их и повторите."
+    exit 1
+  fi
+}
+
+#########################
+# Утилиты
+#########################
 human_size() {
-  # принимает байты, выводит человекочитаемо
+  # принимает байты (integer), выводит человекочитаемо
   local bytes=${1:-0}
+  # если не число, вернуть 0B
+  if ! [[ "$bytes" =~ ^[0-9]+$ ]]; then
+    printf "0B"
+    return
+  fi
   if (( bytes >= 1073741824 )); then
-    printf "%.2fG" "$(bc -l <<<"$bytes/1073741824")"
+    awk -v b="$bytes" 'BEGIN{printf "%.2fG", b/1073741824}'
   elif (( bytes >= 1048576 )); then
-    printf "%.2fM" "$(bc -l <<<"$bytes/1048576")"
+    awk -v b="$bytes" 'BEGIN{printf "%.2fM", b/1048576}'
   elif (( bytes >= 1024 )); then
-    printf "%.2fK" "$(bc -l <<<"$bytes/1024")"
+    awk -v b="$bytes" 'BEGIN{printf "%.2fK", b/1024}'
   else
     printf "%dB" "$bytes"
   fi
@@ -61,10 +82,15 @@ print_system_info() {
   echo "Uptime: $(uptime -p 2>/dev/null || true)"
   echo "CPU: $(awk -F: '/model name/ {print $2; exit}' /proc/cpuinfo | sed 's/^ *//')"
   echo "Cores: $(nproc --all)"
-  mem_total_bytes=$(awk '/MemTotal/ {print $2*1024; exit}' /proc/meminfo)
+
+  local mem_total_bytes
+  mem_total_bytes=$(awk '/MemTotal/ {print $2*1024; exit}' /proc/meminfo || echo 0)
   echo "RAM: $(human_size "$mem_total_bytes")"
-  root_avail_bytes=$(df --output=avail -B1 / | tail -n1)
+
+  local root_avail_bytes
+  root_avail_bytes=$(df --output=avail -B1 / | tail -n1 2>/dev/null || echo 0)
   echo "Root FS available: $(human_size "$root_avail_bytes")"
+
   echo "Disk usage:"
   df -h --output=source,size,used,avail,target | sed '1d' || true
   echo
@@ -76,10 +102,9 @@ print_system_info() {
 }
 
 #########################
-# Проверки
+# Проверки swap/fs
 #########################
 any_swap_active() {
-  # вернёт 0 если любой swap (файл или раздел) активен
   if swapon --noheadings --show=NAME --bytes | grep -q .; then
     return 0
   fi
@@ -87,7 +112,6 @@ any_swap_active() {
 }
 
 swapfile_active() {
-  # вернёт 0 если именно $SWAPFILE активен
   if swapon --noheadings --show=NAME | awk '{print $1}' | grep -Fxq "$SWAPFILE"; then
     return 0
   fi
@@ -123,7 +147,8 @@ ensure_fstab_entry() {
 
 remove_fstab_entry() {
   if grep -Fq "$SWAPFILE" /etc/fstab 2>/dev/null; then
-    sed -i.bak "|$SWAPFILE|d" /etc/fstab || true
+    # используем \| как ограничитель, чтобы корректно обработать слэши в пути
+    sed -i.bak "\|$SWAPFILE|d" /etc/fstab || true
     _info "Удалена запись о $SWAPFILE из /etc/fstab (backup: /etc/fstab.bak)"
   fi
 }
@@ -133,12 +158,22 @@ remove_fstab_entry() {
 #########################
 apply_sysctl_and_save() {
   local sw="$1" vfs="$2"
+  # валидация чисел
+  if ! [[ "$sw" =~ ^[0-9]+$ ]] || (( sw < 0 || sw > 100 )); then
+    _err "Неправильное значение swappiness: $sw"
+    return 1
+  fi
+  if ! [[ "$vfs" =~ ^[0-9]+$ ]]; then
+    _err "Неправильное значение vfs_cache_pressure: $vfs"
+    return 1
+  fi
+
   cat > "$SYSCTL_CONF" <<EOF
 # Автоматически создано скриптом swap.sh
 vm.swappiness = $sw
 vm.vfs_cache_pressure = $vfs
 EOF
-  # Применяем сразу
+
   if command -v sysctl >/dev/null 2>&1; then
     sysctl -p "$SYSCTL_CONF" >/dev/null 2>&1 || true
   fi
@@ -152,23 +187,20 @@ create_swap_file() {
   local size_gb=$1
   check_btrfs_warn
 
-  # Проверка места
   local avail_bytes
-  avail_bytes=$(df --output=avail -B1 / | tail -n1)
+  avail_bytes=$(df --output=avail -B1 / | tail -n1 || echo 0)
   local need_bytes=$(( size_gb * 1024 * 1024 * 1024 ))
   if (( avail_bytes < need_bytes )); then
     _err "На корневом разделе недостаточно места: нужно $(human_size "$need_bytes"), доступно $(human_size "$avail_bytes")."
     return 1
   fi
 
-  # На случай прерывания — создаём tmp-файл и потом переместим
   local tmpfile="${SWAPFILE}.tmp.$$"
   if [[ -f "$SWAPFILE" ]]; then
     _warn "$SWAPFILE уже существует. Будет перезаписан (если вы подтвердите)."
   fi
 
   _info "Создаю swap-файл ($size_gb GB) — это может занять время..."
-  # bs=1M count=size_gb*1024
   dd if=/dev/zero of="$tmpfile" bs=1M count=$(( size_gb * 1024 )) conv=fsync status=progress || {
     _err "dd не удался"
     rm -f "$tmpfile" || true
@@ -177,24 +209,20 @@ create_swap_file() {
   chmod 600 "$tmpfile"
   mkswap "$tmpfile" || { _err "mkswap не удался"; rm -f "$tmpfile"; return 1; }
 
-  # Если есть старый swapfile и он активен — отключим
   if swapfile_active; then
     _info "Отключаю существующий swap-файл $SWAPFILE"
     swapoff "$SWAPFILE" || { _warn "Не удалось отключить $SWAPFILE, продолжаю"; }
   fi
 
-  # Перемещаем tmp в окончательный файл
   mv -f "$tmpfile" "$SWAPFILE"
   chmod 600 "$SWAPFILE"
 
-  # Активируем
   if ! swapon "$SWAPFILE" 2>/dev/null; then
     _err "Не удалось активировать $SWAPFILE как swap"
     rm -f "$SWAPFILE"
     return 1
   fi
 
-  # Проверка: действительно ли активирован
   if ! swapfile_active; then
     _err "$SWAPFILE не появился в swapon --show"
     rm -f "$SWAPFILE"
@@ -224,19 +252,54 @@ remove_swap_file() {
 # Помощь: рекомендованный размер swap
 #########################
 suggest_swap_size_gb() {
-  # простое правило-эмпирика: для маленькой RAM - больше swap, для большой - меньше
   local mem_kb
-  mem_kb=$(awk '/MemTotal/ {print $2; exit}' /proc/meminfo)
-  local mem_gb=$(( (mem_kb/1024/1024) ))
+  mem_kb=$(awk '/MemTotal/ {print $2; exit}' /proc/meminfo || echo 0)
+  local mem_gb=$(( mem_kb / 1024 / 1024 ))
   if (( mem_gb <= 2 )); then
     echo 2
   elif (( mem_gb <= 8 )); then
-    echo $mem_gb
-  elif (( mem_gb <= 32 )); then
-    echo 4
+    echo "$mem_gb"
   else
     echo 4
   fi
+}
+
+#########################
+# Вспомогательные валидации
+#########################
+read_positive_int() {
+  local prompt="$1"
+  local value
+  while true; do
+    read -rp "$prompt" value
+    if [[ -z "$value" ]]; then
+      echo ""
+      return 0
+    fi
+    if [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 0 )); then
+      echo "$value"
+      return 0
+    fi
+    echo "Введите целое неотрицательное число."
+  done
+}
+
+read_sw_vfs() {
+  local sw vfs
+  sw=$(read_positive_int "swappiness (0-100): ")
+  if [[ -z "$sw" ]]; then sw=$DEFAULT_SWAPPINESS; fi
+  if ! [[ "$sw" =~ ^[0-9]+$ ]] || (( sw < 0 || sw > 100 )); then
+    _err "swappiness должно быть числом 0-100"
+    return 1
+  fi
+  vfs=$(read_positive_int "vfs_cache_pressure (обычно 1-200): ")
+  if [[ -z "$vfs" ]]; then vfs=$DEFAULT_VFS; fi
+  if ! [[ "$vfs" =~ ^[0-9]+$ ]]; then
+    _err "vfs_cache_pressure должно быть числом"
+    return 1
+  fi
+  printf "%s %s" "$sw" "$vfs"
+  return 0
 }
 
 #########################
@@ -261,6 +324,8 @@ menu_no_swap() {
         if ! [[ $sz =~ ^[0-9]+$ ]]; then _err "Неправильный ввод"; return 1; fi
         read -rp "swappiness (0-100): " sw
         read -rp "vfs_cache_pressure (обычно 1-200): " vfs
+        if ! [[ "$sw" =~ ^[0-9]+$ ]] || (( sw < 0 || sw > 100 )); then _err "Неправильный swappiness"; return 1; fi
+        if ! [[ "$vfs" =~ ^[0-9]+$ ]]; then _err "Неправильный vfs_cache_pressure"; return 1; fi
         create_swap_file "$sz" || return 1
         apply_sysctl_and_save "$sw" "$vfs"
         break
@@ -295,6 +360,8 @@ menu_with_swap() {
             2)
               read -rp "swappiness (0-100): " sw
               read -rp "vfs_cache_pressure: " vfs
+              if ! [[ "$sw" =~ ^[0-9]+$ ]] || (( sw < 0 || sw > 100 )); then _err "Неправильный swappiness"; break; fi
+              if ! [[ "$vfs" =~ ^[0-9]+$ ]]; then _err "Неправильный vfs_cache_pressure"; break; fi
               apply_sysctl_and_save "$sw" "$vfs"; break 2
               ;;
             3) break; ;;
@@ -303,7 +370,6 @@ menu_with_swap() {
         done
         ;;
       3)
-        # если активен swap-раздел, предупреждаем
         if any_swap_active && ! swapfile_active; then
           _warn "На системе активен swap но он не является файлом (возможно это раздел)."
           read -rp "Вы хотите отключить существующий swap и создать swap-файл вместо него? (y/N): " ans
@@ -313,13 +379,11 @@ menu_with_swap() {
         fi
         read -rp "Размер нового swap в ГБ (рекомендуется $(suggest_swap_size_gb) ): " new_sz
         if ! [[ $new_sz =~ ^[0-9]+$ ]]; then _err "Неправильный ввод"; return 1; fi
-        # Удаляем старый swapfile (если это он)
         if swapfile_active || [[ -f "$SWAPFILE" ]]; then
           _info "Отключаю и удаляю старый swap-файл (если есть)"
           remove_swap_file || _warn "Не удалось полностью удалить старый swap-файл"
         fi
         create_swap_file "$new_sz" || { _err "Не удалось создать новый swap"; return 1; }
-        # применяем настройки
         echo "Применить оптимальные sysctl настройки?"
         select a in "Да" "Нет, задан вручную"; do
           case $REPLY in
@@ -327,6 +391,8 @@ menu_with_swap() {
             2)
               read -rp "swappiness: " sw
               read -rp "vfs_cache_pressure: " vfs
+              if ! [[ "$sw" =~ ^[0-9]+$ ]] || (( sw < 0 || sw > 100 )); then _err "Неправильный swappiness"; break; fi
+              if ! [[ "$vfs" =~ ^[0-9]+$ ]]; then _err "Неправильный vfs_cache_pressure"; break; fi
               apply_sysctl_and_save "$sw" "$vfs"; break;;
             *) echo "Выберите 1-2";;
           esac
@@ -347,6 +413,7 @@ menu_with_swap() {
 #########################
 main() {
   require_root
+  require_commands
   print_system_info
 
   if any_swap_active; then
