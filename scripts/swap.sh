@@ -1,332 +1,363 @@
 #!/usr/bin/env bash
 # ======================================================
-#  🧊 Universal SWAP Manager — удобный модуль (fixed)
-#  Поддержка: Ubuntu, Debian
+#  🧊 Universal SWAP Manager
+#  Универсальный скрипт для управления swap-файлом на Ubuntu/Debian
+#  Автор: Plaga совместно с ChatGPT
+#  Цели:
+#  - показать текущую систему (CPU, RAM, диск, swap)
+#  - создать / пересоздать swap-файл с опциями по умолчанию или пользовательскими
+#  - сохранить vm.swappiness и vm.vfs_cache_pressure в /etc/sysctl.d/99-swap-tuning.conf
+#  - аккуратно работать с /etc/fstab (добавлять/удалять запись про swap-файл)
+#  - предупреждать про btrfs и swap-разделы
 # ======================================================
 
 set -o errexit
 set -o nounset
 set -o pipefail
+IFS=$'\n\t'
 
 SWAPFILE="/swapfile"
 SYSCTL_CONF="/etc/sysctl.d/99-swap-tuning.conf"
-BLOCK_SIZE_BYTES=$((4 * 1024 * 1024))   # 4 MiB
-BAR_WIDTH=30
+DEFAULT_SWAPPINESS=10
+DEFAULT_VFS=50
 
-# colors
-CLR_BOLD="\e[1m"
-CLR_RESET="\e[0m"
-CLR_CYAN="\e[36m"
-CLR_GREEN="\e[32m"
-CLR_YELLOW="\e[33m"
-CLR_RED="\e[31m"
+#########################
+# Логирование
+#########################
+_info() { printf "[INFO] %s\n" "$*"; }
+_warn() { printf "[WARN] %s\n" "$*"; }
+_err() { printf "[ERROR] %s\n" "$*" >&2; }
 
-# run as root
-if [[ $EUID -ne 0 ]]; then
-  echo "Запустите скрипт от root (sudo)."
-  exit 1
-fi
-
-# ---------- helpers ----------
-human_readable_bytes() {
-  awk -v b="$1" 'BEGIN{
-    if (b < 1024) { printf "%dB", b; exit }
-    if (b < 1024*1024) { printf "%.1fK", b/1024; exit }
-    if (b < 1024*1024*1024) { printf "%.1fM", b/1024/1024; exit }
-    printf "%.1fG", b/1024/1024/1024
-  }'
-}
-
-get_total_ram_gb() { awk '/MemTotal/ {printf "%.1f", $2/1024/1024}' /proc/meminfo; }
-get_avail_ram_gb()  { awk '/MemAvailable/ {printf "%.1f", $2/1024/1024}' /proc/meminfo; }
-get_root_disk_total() { df -h / | awk 'NR==2 {print $2}'; }
-get_root_disk_avail()  { df -h / | awk 'NR==2 {print $4}'; }
-get_swap_bytes() { awk 'BEGIN{sum=0} {sum+=$3} END{print (sum?sum:0)}' < <(swapon --show --bytes --noheadings 2>/dev/null || true); }
-
-get_swappiness() { sysctl -n vm.swappiness 2>/dev/null || echo "не задано"; }
-get_vfs_cache_pressure() { sysctl -n vm.vfs_cache_pressure 2>/dev/null || echo "не задано"; }
-
-get_cpu_info() {
-  local cores=$(nproc --all 2>/dev/null || echo "?")
-  local mhz=$(awk '/cpu MHz/ {sum+=$4; n++} END{if(n>0) printf "%.1f", sum/n/1000; else print "?"}' /proc/cpuinfo 2>/dev/null)
-  if [[ "$mhz" == "?" ]]; then
-    echo "${cores} vCore"
-  else
-    printf "%s vCore @ %s GHz" "$cores" "$mhz"
+#########################
+# Утилиты
+#########################
+require_root() {
+  if [[ $EUID -ne 0 ]]; then
+    _err "Этот скрипт должен быть запущен от root (или sudo)."
+    exit 1
   fi
 }
 
-# ---------- system info ----------
-show_system_info() {
-  clear
-  echo -e "${CLR_CYAN}${CLR_BOLD}🧊  Universal SWAP Manager — удобный модуль${CLR_RESET}"
-  echo ""
-  echo -e "${CLR_CYAN}📌 Информация о системе:${CLR_RESET}"
-  echo -n "  ▸ CPU (процессор):      "; echo -e "${CLR_YELLOW}$(get_cpu_info)${CLR_RESET}"
-  echo -n "  ▸ RAM (объём оперативной памяти):  "; echo -e "${CLR_YELLOW}$(get_total_ram_gb) GiB (доступно: $(get_avail_ram_gb) GiB)${CLR_RESET}"
-  echo -n "  ▸ Disk / (объём диска): "; echo -e "${CLR_YELLOW}$(get_root_disk_total) (свободно: $(get_root_disk_avail))${CLR_RESET}"
-
-  local swap_bytes
-  swap_bytes=$(get_swap_bytes)
-  if [[ -n "$swap_bytes" && "$swap_bytes" -gt 0 ]]; then
-    echo -n "  ▸ SWAP (объём файла подкачки): "; echo -e "${CLR_YELLOW}$(human_readable_bytes "$swap_bytes")${CLR_RESET}"
+human_size() {
+  # принимает байты, выводит человекочитаемо
+  local bytes=${1:-0}
+  if (( bytes >= 1073741824 )); then
+    printf "%.2fG" "$(bc -l <<<"$bytes/1073741824")"
+  elif (( bytes >= 1048576 )); then
+    printf "%.2fM" "$(bc -l <<<"$bytes/1048576")"
+  elif (( bytes >= 1024 )); then
+    printf "%.2fK" "$(bc -l <<<"$bytes/1024")"
   else
-    echo -n "  ▸ SWAP (объём файла подкачки): "; echo -e "${CLR_YELLOW}не найден${CLR_RESET}"
+    printf "%dB" "$bytes"
   fi
-
-  echo -n "  ▸ swappiness*:          "; echo -e "${CLR_YELLOW}$(get_swappiness)${CLR_RESET}"
-  echo -n "  ▸ vfs_cache_pressure**: "; echo -e "${CLR_YELLOW}$(get_vfs_cache_pressure)${CLR_RESET}"
-  echo ""
-  echo -e "* swappiness — параметр, отвечающий за то, как активно будет использоваться swap (связан с файлом подкачки)"
-  echo -e "** vfs_cache_pressure — параметр, отвечающий за то, как долго хранится файловый кэш; работает всегда и влияет на RAM независимо от swap"
-  echo ""
 }
 
-# ---------- apply sysctl ----------
+#########################
+# Информация о системе
+#########################
+print_system_info() {
+  echo "================= System info ================="
+  echo "Kernel: $(uname -sr)"
+  echo "Uptime: $(uptime -p 2>/dev/null || true)"
+  echo "CPU: $(awk -F: '/model name/ {print $2; exit}' /proc/cpuinfo | sed 's/^ *//')"
+  echo "Cores: $(nproc --all)"
+  mem_total_bytes=$(awk '/MemTotal/ {print $2*1024; exit}' /proc/meminfo)
+  echo "RAM: $(human_size "$mem_total_bytes")"
+  root_avail_bytes=$(df --output=avail -B1 / | tail -n1)
+  echo "Root FS available: $(human_size "$root_avail_bytes")"
+  echo "Disk usage:"
+  df -h --output=source,size,used,avail,target | sed '1d' || true
+  echo
+  echo "Swap currently active:"
+  swapon --show --bytes || true
+  echo "vm.swappiness: $(cat /proc/sys/vm/swappiness 2>/dev/null || echo 'N/A')"
+  echo "vm.vfs_cache_pressure: $(cat /proc/sys/vm/vfs_cache_pressure 2>/dev/null || echo 'N/A')"
+  echo "================================================"
+}
+
+#########################
+# Проверки
+#########################
+any_swap_active() {
+  # вернёт 0 если любой swap (файл или раздел) активен
+  if swapon --noheadings --show=NAME --bytes | grep -q .; then
+    return 0
+  fi
+  return 1
+}
+
+swapfile_active() {
+  # вернёт 0 если именно $SWAPFILE активен
+  if swapon --noheadings --show=NAME | awk '{print $1}' | grep -Fxq "$SWAPFILE"; then
+    return 0
+  fi
+  return 1
+}
+
+fstype_of_root() {
+  findmnt -n -o FSTYPE / || true
+}
+
+check_btrfs_warn() {
+  local fstype
+  fstype=$(fstype_of_root)
+  if [[ "$fstype" == "btrfs" ]]; then
+    _warn "Файловая система корня: btrfs. Swap-файлы на btrfs могут работать некорректно (нужны специальные опции)."
+    read -rp "Продолжить создание swap-файла на btrfs? (y/N): " ans
+    [[ "$ans" =~ ^[Yy] ]] || { _info "Отмена по выбору пользователя."; exit 1; }
+  fi
+}
+
+#########################
+# Управление /etc/fstab
+#########################
+ensure_fstab_entry() {
+  local entry="$SWAPFILE none swap sw 0 0"
+  if grep -Fq "$SWAPFILE" /etc/fstab 2>/dev/null; then
+    _info "Запись для $SWAPFILE уже есть в /etc/fstab"
+  else
+    echo "$entry" >> /etc/fstab
+    _info "Добавлена запись $SWAPFILE в /etc/fstab"
+  fi
+}
+
+remove_fstab_entry() {
+  if grep -Fq "$SWAPFILE" /etc/fstab 2>/dev/null; then
+    sed -i.bak "|$SWAPFILE|d" /etc/fstab || true
+    _info "Удалена запись о $SWAPFILE из /etc/fstab (backup: /etc/fstab.bak)"
+  fi
+}
+
+#########################
+# sysctl
+#########################
 apply_sysctl_and_save() {
-  local sw="$1"; local vfs="$2"
+  local sw="$1" vfs="$2"
   cat > "$SYSCTL_CONF" <<EOF
-# Applied by swap.sh
+# Автоматически создано скриптом swap.sh
 vm.swappiness = $sw
 vm.vfs_cache_pressure = $vfs
 EOF
-  sysctl -p "$SYSCTL_CONF" >/dev/null 2>&1 || true
+  # Применяем сразу
+  if command -v sysctl >/dev/null 2>&1; then
+    sysctl -p "$SYSCTL_CONF" >/dev/null 2>&1 || true
+  fi
+  _info "Записаны и применены sysctl: vm.swappiness=$sw vm.vfs_cache_pressure=$vfs"
 }
 
-# ---------- fstab helpers ----------
-ensure_fstab_entry() {
-  sed -i "\|$SWAPFILE|d" /etc/fstab 2>/dev/null || true
-  echo "$SWAPFILE none swap sw 0 0" >> /etc/fstab
-}
-remove_swap_from_fstab() {
-  sed -i "\|$SWAPFILE|d" /etc/fstab 2>/dev/null || true
-}
+#########################
+# Создание swap
+#########################
+create_swap_file() {
+  local size_gb=$1
+  check_btrfs_warn
 
-# ---------- validate integer ----------
-read_integer() {
-  local prompt="$1"; local min=${2:-0}; local max=${3:-999999}; local val
-  while true; do
-    read -rp "$prompt" val
-    if [[ "$val" =~ ^[0-9]+$ ]] && (( val >= min && val <= max )); then
-      echo "$val"; return 0
-    fi
-    echo "Ошибка: введите целое число от $min до $max."
-  done
-}
-
-# ---------- check free space ----------
-check_free_space_bytes() {
-  # returns available bytes on root '/'
-  df --output=avail -B1 / | awk 'NR==2{print $1}'
-}
-
-# ---------- create swap using dd status=progress ----------
-create_swap_dd_progress() {
-  local size_gb="$1"
-  local total_bytes=$(( size_gb * 1024 * 1024 * 1024 ))
-
-  # check disk free
+  # Проверка места
   local avail_bytes
-  avail_bytes=$(check_free_space_bytes)
-  if [[ -z "$avail_bytes" ]]; then
-    echo "Не удалось определить свободное место на диске. Продолжение рискованно. Подтвердите вручную."
-  fi
-
-  # require at least total_bytes + 100MB margin
-  local margin=$((100 * 1024 * 1024))
-  if (( avail_bytes < total_bytes + margin )); then
-    echo -e "${CLR_RED}Недостаточно свободного места на разделе / для создания swap ${size_gb}G.${CLR_RESET}"
-    echo "Свободно: $(human_readable_bytes "$avail_bytes"), требуется примерно: $(human_readable_bytes $((total_bytes + margin)))"
-    read -rp "Продолжить всё равно? (y/N): " confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-      echo "Отмена."
-      return 1
-    fi
-  fi
-
-  # disable/remove existing
-  swapoff -a 2>/dev/null || true
-  remove_swap_from_fstab
-  rm -f "$SWAPFILE" 2>/dev/null || true
-
-  # Create using dd with status=progress
-  local count=$(( size_gb * 256 ))   # because bs=4M -> 4MiB * 256 = 1GiB
-  echo ""
-  echo -e "${CLR_YELLOW}Запуск dd: создаём /swapfile ${size_gb}G (bs=4M count=${count}).${CLR_RESET}"
-  echo -e "Вы увидите прогресс в формате dd (bytes copied, скорость)."
-
-  # Run dd — status=progress prints to stderr by default
-  if ! dd if=/dev/zero of="$SWAPFILE" bs=4M count="$count" status=progress conv=fsync 2>&1; then
-    echo -e "${CLR_RED}dd вернул ошибку при записи файла.${CLR_RESET}"
+  avail_bytes=$(df --output=avail -B1 / | tail -n1)
+  local need_bytes=$(( size_gb * 1024 * 1024 * 1024 ))
+  if (( avail_bytes < need_bytes )); then
+    _err "На корневом разделе недостаточно места: нужно $(human_size "$need_bytes"), доступно $(human_size "$avail_bytes")."
     return 1
   fi
 
+  # На случай прерывания — создаём tmp-файл и потом переместим
+  local tmpfile="${SWAPFILE}.tmp.$$"
+  if [[ -f "$SWAPFILE" ]]; then
+    _warn "$SWAPFILE уже существует. Будет перезаписан (если вы подтвердите)."
+  fi
+
+  _info "Создаю swap-файл ($size_gb GB) — это может занять время..."
+  # bs=1M count=size_gb*1024
+  dd if=/dev/zero of="$tmpfile" bs=1M count=$(( size_gb * 1024 )) conv=fsync status=progress || {
+    _err "dd не удался"
+    rm -f "$tmpfile" || true
+    return 1
+  }
+  chmod 600 "$tmpfile"
+  mkswap "$tmpfile" || { _err "mkswap не удался"; rm -f "$tmpfile"; return 1; }
+
+  # Если есть старый swapfile и он активен — отключим
+  if swapfile_active; then
+    _info "Отключаю существующий swap-файл $SWAPFILE"
+    swapoff "$SWAPFILE" || { _warn "Не удалось отключить $SWAPFILE, продолжаю"; }
+  fi
+
+  # Перемещаем tmp в окончательный файл
+  mv -f "$tmpfile" "$SWAPFILE"
   chmod 600 "$SWAPFILE"
-  if ! mkswap "$SWAPFILE" >/dev/null 2>&1; then
-    echo -e "${CLR_RED}mkswap не удался.${CLR_RESET}"
+
+  # Активируем
+  if ! swapon "$SWAPFILE" 2>/dev/null; then
+    _err "Не удалось активировать $SWAPFILE как swap"
+    rm -f "$SWAPFILE"
     return 1
   fi
-  if ! swapon "$SWAPFILE" >/dev/null 2>&1; then
-    echo -e "${CLR_RED}swapon не удался.${CLR_RESET}"
+
+  # Проверка: действительно ли активирован
+  if ! swapfile_active; then
+    _err "$SWAPFILE не появился в swapon --show"
+    rm -f "$SWAPFILE"
     return 1
   fi
 
   ensure_fstab_entry
+  _info "Swap-файл $SWAPFILE создан и активирован"
   return 0
 }
 
-# ---------- Menus ----------
-menu_when_swap_exists() {
-  while true; do
-    echo ""
-    echo -e "${CLR_CYAN}Выберите действие:${CLR_RESET}"
-    echo "1) Оставить существующий swap"
-    echo "2) Настроить параметры (swappiness / vfs_cache_pressure)"
-    echo "3) Пересоздать swap"
-    echo "4) Выход"
-    read -rp "Выбор [1-4]: " CH
-    case "$CH" in
+remove_swap_file() {
+  if swapfile_active; then
+    _info "Отключаю swap-файл $SWAPFILE"
+    swapoff "$SWAPFILE" || { _warn "Не удалось отключить $SWAPFILE"; }
+  fi
+  if [[ -f "$SWAPFILE" ]]; then
+    rm -f "$SWAPFILE"
+    _info "$SWAPFILE удалён"
+  else
+    _info "Файл $SWAPFILE не найден, ничего не удаляю"
+  fi
+  remove_fstab_entry
+}
+
+#########################
+# Помощь: рекомендованный размер swap
+#########################
+suggest_swap_size_gb() {
+  # простое правило-эмпирика: для маленькой RAM - больше swap, для большой - меньше
+  local mem_kb
+  mem_kb=$(awk '/MemTotal/ {print $2; exit}' /proc/meminfo)
+  local mem_gb=$(( (mem_kb/1024/1024) ))
+  if (( mem_gb <= 2 )); then
+    echo 2
+  elif (( mem_gb <= 8 )); then
+    echo $mem_gb
+  elif (( mem_gb <= 32 )); then
+    echo 4
+  else
+    echo 4
+  fi
+}
+
+#########################
+# Меню
+#########################
+menu_no_swap() {
+  echo "На системе не найден активный swap. Что сделать?"
+  select opt in "Создать swap с оптимальными настройками" "Создать swap с моими настройками" "Выход"; do
+    case $REPLY in
       1)
-        clear; echo "Ничего не изменено. Осуществлён выход из Universal SWAP Manager"; exit 0
+        local size_gb
+        size_gb=$(suggest_swap_size_gb)
+        read -rp "Размер swap в ГБ (рекомендуется $size_gb GB): " input_sz
+        input_sz=${input_sz:-$size_gb}
+        if ! [[ $input_sz =~ ^[0-9]+$ ]]; then _err "Неправильный ввод"; return 1; fi
+        create_swap_file "$input_sz" || return 1
+        apply_sysctl_and_save "$DEFAULT_SWAPPINESS" "$DEFAULT_VFS"
+        break
         ;;
       2)
-        clear
-        echo -e "${CLR_CYAN}Пояснение параметров:${CLR_RESET}"
-        echo ""
-        echo "  ▸ swappiness — как активно будет использоваться swap"
-        echo "       0–10: Почти не использовать swap (только при реальном OOM)"
-        echo "       10–20: Оптимально для серверов и нод"
-        echo "       30–40: Нормально для десктопов"
-        echo "       60: Значение по умолчанию в Ubuntu"
-        echo "       80–100: Агрессивное свопирование"
-        echo ""
-        echo "  ▸ vfs_cache_pressure — как долго хранится файловый кэш"
-        echo "       1–50: Кэш хранится дольше (лучше для серверов/нод)"
-        echo "       100: Значение по умолчанию в Ubuntu"
-        echo "       150–200: Быстрое очищение кэша"
-        echo ""
-        echo "Выбор:"
-        echo "1) Применить значения по умолчанию (10 / 50) — оптимально для нод"
-        echo "2) Ввести свои значения"
-        echo "3) Отмена"
-        read -rp "Выбор [1-3]: " opt
-        case "$opt" in
-          1)
-            apply_sysctl_and_save 10 50
-            clear
-            echo -e "${CLR_GREEN}✔ Применены оптимальные для нод параметры: swappiness=10, vfs_cache_pressure=50${CLR_RESET}"; exit 0
-            # read -rp "Нажмите Enter чтобы вернуться в меню..."
-            # clear
-            ;;
-          2)
-            sw=$(read_integer "Введите swappiness (0–100): " 0 100)
-            cpv=$(read_integer "Введите vfs_cache_pressure (1–200): " 1 200)
-            apply_sysctl_and_save "$sw" "$cpv"
-            clear
-            echo -e "${CLR_GREEN}✔ Параметры применены: swappiness=${sw}, vfs_cache_pressure=${cpv}${CLR_RESET}"; exit 0
-            # read -rp "Нажмите Enter чтобы вернуться в меню..."
-            # clear
-            ;;
-          *)
-            clear; echo "Отмена."
-            ;;
-        esac
+        read -rp "Размер swap в ГБ: " sz
+        if ! [[ $sz =~ ^[0-9]+$ ]]; then _err "Неправильный ввод"; return 1; fi
+        read -rp "swappiness (0-100): " sw
+        read -rp "vfs_cache_pressure (обычно 1-200): " vfs
+        create_swap_file "$sz" || return 1
+        apply_sysctl_and_save "$sw" "$vfs"
+        break
         ;;
       3)
-        clear
-        echo "Пересоздание swap (существующий swap будет удалён)."
-        sz=$(read_integer "Введите размер нового swap в ГБ (например, 8): " 1 65536)
-        echo ""
-        echo "По умолчанию используются параметры (оптимально для нод):"
-        echo "  ▸ swappiness: 10"
-        echo "  ▸ vfs_cache_pressure: 50"
-        read -rp "Использовать значения по умолчанию (10 / 50)? (Y/n): " yn
-        if [[ "$yn" =~ ^[Nn]$ ]]; then
-          sw=$(read_integer "Введите swappiness (0–100): " 0 100)
-          cpv=$(read_integer "Введите vfs_cache_pressure (1–200): " 1 200)
-        else
-          sw=10; cpv=50
-        fi
-        echo -e "${CLR_YELLOW}Начинаю пересоздание swap (${sz}G). Это может занять несколько минут...${CLR_RESET}"
-        if create_swap_dd_progress "$sz"; then
-          apply_sysctl_and_save "$sw" "$cpv"
-          clear
-          echo -e "${CLR_GREEN}✔ Swap пересоздан и параметры применены.${CLR_RESET}"
-          swapon --show || true
-          exit 0
-          # read -rp "Нажмите Enter чтобы вернуться в меню..."
-          # clear
-        else
-          echo -e "${CLR_RED}Ошибка при создании swap.${CLR_RESET}"
-          read -rp "Нажмите Enter чтобы вернуться в меню..."
-          clear
-        fi
+        _info "Выход"
+        exit 0
         ;;
-      4)
-        clear; echo "Выход."; exit 0
-        ;;
-      *)
-        echo "Неверный выбор."
-        ;;
+      *) echo "Выберите 1-3";;
     esac
   done
 }
 
-menu_when_no_swap() {
-  while true; do
-    echo ""
-    echo -e "${CLR_CYAN}Swap не найден.${CLR_RESET}"
-    echo "Выберите действие:"
-    echo "1) Создать swap"
-    echo "2) Выход"
-    read -rp "Выбор [1-2]: " ch
-    case "$ch" in
+menu_with_swap() {
+  echo "На системе найден активный swap (файл или раздел)."
+  echo "Детали:"
+  swapon --show --bytes
+  PS3="Выберите действие: "
+  select opt in "Оставить существующий swap" "Изменить настройки swappiness/vfs_cache_pressure" "Пересоздать swap-файл (удалить существующий swap-файл и создать новый)" "Выход"; do
+    case $REPLY in
       1)
-        clear
-        sz=$(read_integer "Введите размер swap в ГБ (например, 8): " 1 65536)
-        echo ""
-        echo "По умолчанию используются параметры (оптимально для нод):"
-        echo "  ▸ swappiness: 10"
-        echo "  ▸ vfs_cache_pressure: 50"
-        read -rp "Использовать значения по умолчанию (10 / 50)? (Y/n): " yn
-        if [[ "$yn" =~ ^[Nn]$ ]]; then
-          sw=$(read_integer "Введите swappiness (0–100): " 0 100)
-          cpv=$(read_integer "Введите vfs_cache_pressure (1–200): " 1 200)
-        else
-          sw=10; cpv=50
-        fi
-        echo -e "${CLR_YELLOW}Создание swap файла (${sz}G). Это может занять несколько минут...${CLR_RESET}"
-        if create_swap_dd_progress "$sz"; then
-          apply_sysctl_and_save "$sw" "$cpv"
-          clear
-          echo -e "${CLR_GREEN}✔ Swap создан и параметры применены.${CLR_RESET}"
-          swapon --show || true
-          exit 0
-          # read -rp "Нажмите Enter чтобы вернуться в меню..."
-          # clear
-        else
-          echo -e "${CLR_RED}Ошибка при создании swap.${CLR_RESET}"
-          read -rp "Нажмите Enter чтобы вернуться в меню..."
-          clear
-        fi
+        _info "Ничего не делаю"
+        break
         ;;
       2)
-        clear; echo "Выход."; exit 0
+        echo "Выберите:"
+        select sopt in "Использовать оптимальные ($DEFAULT_SWAPPINESS/$DEFAULT_VFS)" "Задать вручную" "Назад"; do
+          case $REPLY in
+            1)
+              apply_sysctl_and_save "$DEFAULT_SWAPPINESS" "$DEFAULT_VFS"; break 2
+              ;;
+            2)
+              read -rp "swappiness (0-100): " sw
+              read -rp "vfs_cache_pressure: " vfs
+              apply_sysctl_and_save "$sw" "$vfs"; break 2
+              ;;
+            3) break; ;;
+            *) echo "Выберите 1-3";;
+          esac
+        done
         ;;
-      *)
-        echo "Неверный выбор."
+      3)
+        # если активен swap-раздел, предупреждаем
+        if any_swap_active && ! swapfile_active; then
+          _warn "На системе активен swap но он не является файлом (возможно это раздел)."
+          read -rp "Вы хотите отключить существующий swap и создать swap-файл вместо него? (y/N): " ans
+          if [[ ! "$ans" =~ ^[Yy]$ ]]; then
+            _info "Отмена пересоздания."; break
+          fi
+        fi
+        read -rp "Размер нового swap в ГБ (рекомендуется $(suggest_swap_size_gb) ): " new_sz
+        if ! [[ $new_sz =~ ^[0-9]+$ ]]; then _err "Неправильный ввод"; return 1; fi
+        # Удаляем старый swapfile (если это он)
+        if swapfile_active || [[ -f "$SWAPFILE" ]]; then
+          _info "Отключаю и удаляю старый swap-файл (если есть)"
+          remove_swap_file || _warn "Не удалось полностью удалить старый swap-файл"
+        fi
+        create_swap_file "$new_sz" || { _err "Не удалось создать новый swap"; return 1; }
+        # применяем настройки
+        echo "Применить оптимальные sysctl настройки?"
+        select a in "Да" "Нет, задан вручную"; do
+          case $REPLY in
+            1) apply_sysctl_and_save "$DEFAULT_SWAPPINESS" "$DEFAULT_VFS"; break;;
+            2)
+              read -rp "swappiness: " sw
+              read -rp "vfs_cache_pressure: " vfs
+              apply_sysctl_and_save "$sw" "$vfs"; break;;
+            *) echo "Выберите 1-2";;
+          esac
+        done
+        break
         ;;
+      4)
+        _info "Выход"
+        exit 0
+        ;;
+      *) echo "Выберите 1-4";;
     esac
   done
 }
 
-# ---------- run ----------
-show_system_info
-swap_bytes=$(get_swap_bytes)
-if [[ -n "$swap_bytes" && "$swap_bytes" -gt 0 ]]; then
-  menu_when_swap_exists
-else
-  menu_when_no_swap
-fi
+#########################
+# main
+#########################
+main() {
+  require_root
+  print_system_info
 
-# end
+  if any_swap_active; then
+    menu_with_swap
+  else
+    menu_no_swap
+  fi
+
+  _info "Операция завершена. Текущий swap:"
+  swapon --show --bytes || true
+  _info "Текущие параметры: vm.swappiness=$(cat /proc/sys/vm/swappiness 2>/dev/null || echo N/A), vm.vfs_cache_pressure=$(cat /proc/sys/vm/vfs_cache_pressure 2>/dev/null || echo N/A)"
+}
+
+main "$@"
