@@ -253,6 +253,7 @@ menu_when_swap_exists() {
           clear
           echo -e "${CLR_GREEN}✔ Swap пересоздан и параметры применены.${CLR_RESET}"
           swapon --show || true
+          exit 0
           read -rp "Нажмите Enter чтобы вернуться в меню..."
           clear
         else
@@ -300,6 +301,7 @@ menu_when_no_swap() {
           clear
           echo -e "${CLR_GREEN}✔ Swap создан и параметры применены.${CLR_RESET}"
           swapon --show || true
+          exit 0
           read -rp "Нажмите Enter чтобы вернуться в меню..."
           clear
         else
