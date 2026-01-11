@@ -24,7 +24,23 @@ DEFAULT_VFS=50
 is_tty() { [[ -t 1 ]]; }
 
 supports_color() {
-  is_tty && [[ "${TERM:-}" != "dumb" ]]
+  # уважаем стандарт NO_COLOR
+  [[ -n "${NO_COLOR:-}" ]] && return 1
+
+  # принудительное включение цветов
+  [[ "${FORCE_COLOR:-0}" == "1" ]] && return 0
+
+  is_tty || return 1
+  [[ -n "${TERM:-}" && "${TERM:-}" != "dumb" ]] || return 1
+
+  # если есть tput — проверим, что цветов хватает
+  if command -v tput >/dev/null 2>&1; then
+    local n
+    n="$(tput colors 2>/dev/null || echo 0)"
+    [[ "$n" -ge 8 ]] || return 1
+  fi
+
+  return 0
 }
 
 if supports_color; then
@@ -58,7 +74,7 @@ else
   I_ERR="X"
 fi
 
-ui_hr() { printf "%b\n" "${C_GRAY}------------------------------------------------------------${C_RESET}"; }
+ui_hr() { printf "%b\n" "${C_DIM}------------------------------------------------------------${C_RESET}"; }
 
 ui_title() {
   ui_hr
