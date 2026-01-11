@@ -28,19 +28,34 @@ supports_color() {
 }
 
 if supports_color; then
-  C_RESET="\033[0m"
-  C_BOLD="\033[1m"
-  C_DIM="\033[2m"
-  C_RED="\033[31m"
-  C_GREEN="\033[32m"
-  C_YELLOW="\033[33m"
-  C_BLUE="\033[34m"
-  C_MAGENTA="\033[35m"
-  C_CYAN="\033[36m"
-  C_GRAY="\033[90m"
+  C_RESET=$'\e[0m'
+  C_BOLD=$'\e[1m'
+  C_DIM=$'\e[2m'
+  C_RED=$'\e[31m'
+  C_GREEN=$'\e[32m'
+  C_YELLOW=$'\e[33m'
+  C_BLUE=$'\e[34m'
+  C_MAGENTA=$'\e[35m'
+  C_CYAN=$'\e[36m'
+  C_GRAY=$'\e[90m'
 else
   C_RESET="" C_BOLD="" C_DIM=""
   C_RED="" C_GREEN="" C_YELLOW="" C_BLUE="" C_MAGENTA="" C_CYAN="" C_GRAY=""
+fi
+
+supports_utf8() {
+  local loc="${LC_ALL:-${LANG:-}}"
+  [[ "$loc" == *"UTF-8"* || "$loc" == *"utf8"* ]]
+}
+
+if supports_utf8; then
+  I_OK="✔"
+  I_WARN="⚠"
+  I_ERR="✖"
+else
+  I_OK="OK"
+  I_WARN="!"
+  I_ERR="X"
 fi
 
 ui_hr() { printf "%b\n" "${C_GRAY}------------------------------------------------------------${C_RESET}"; }
@@ -51,10 +66,13 @@ ui_title() {
   ui_hr
 }
 
-ui_ok()   { printf "%b[OK]%b %s\n"   "${C_GREEN}${C_BOLD}" "${C_RESET}" "$*"; }
-ui_info() { printf "%b[INFO]%b %s\n" "${C_CYAN}${C_BOLD}"  "${C_RESET}" "$*"; }
-ui_warn() { printf "%b[WARN]%b %s\n" "${C_YELLOW}${C_BOLD}" "${C_RESET}" "$*"; }
-ui_err()  { printf "%b[ERR]%b %s\n"  "${C_RED}${C_BOLD}"    "${C_RESET}" "$*" >&2; }
+ui_ok()   { printf "%b%s%b %s\n" "${C_GREEN}${C_BOLD}" "$I_OK"   "${C_RESET}" "$*"; }
+ui_info() { printf "%b[INFO]%b %s\n" "${C_CYAN}${C_BOLD}" "${C_RESET}" "$*"; }
+ui_warn() { printf "%b%s%b %s\n" "${C_YELLOW}${C_BOLD}" "$I_WARN" "${C_RESET}" "$*"; }
+ui_err()  { printf "%b%s%b %s\n" "${C_RED}${C_BOLD}" "$I_ERR"  "${C_RESET}" "$*" >&2; }
+
+ui_ln() { printf "%b\n" "$*"; }
+ui_no_ln() { printf "%b" "$*"; }
 
 ui_pause() {
   echo
@@ -92,7 +110,7 @@ EOF
     printf "%b\n" "${C_RESET}"
   fi
 
-  printf "%b\n" "${C_DIM}Универсальный менеджер swap для Ubuntu/Debian (под ноды)${C_RESET}"
+  printf "%b\n\n" "${C_DIM}Универсальный менеджер swap для Ubuntu/Debian (под ноды)${C_RESET}"
   ui_hr
 }
 
@@ -486,14 +504,14 @@ menu_no_swap() {
     print_banner
     ui_title "Swap не найден"
 
-    echo -e "${C_DIM}Рекомендуемый swap по RAM (${C_BOLD}$(human_size "$mem_bytes")${C_DIM}): ${C_BOLD}${rec_gb}G${C_RESET}"
-    echo -e "${C_DIM}Режим 1 минимизирует риск OOM и снижает I/O-лаг за счёт low swappiness.${C_RESET}"
+    ui_ln "${C_DIM}Рекомендуемый swap по RAM (${C_BOLD}$(human_size "$mem_bytes")${C_DIM}): ${C_BOLD}${rec_gb}G${C_RESET}"
+    ui_ln "${C_DIM}Режим 1 минимизирует риск OOM и снижает I/O-лаг за счёт low swappiness.${C_RESET}"
     echo
 
-    echo -e " ${C_GRAY}0)${C_RESET} Показать системную информацию ещё раз"
-    echo -e " ${C_GREEN}1)${C_RESET} Создать swapfile ${C_BOLD}${rec_gb}G${C_RESET} + swappiness=${DEFAULT_SWAPPINESS} + vfs_cache_pressure=${DEFAULT_VFS} ${C_DIM}(рекомендуется)${C_RESET}"
-    echo -e " ${C_CYAN}2)${C_RESET} Создать swapfile со своими настройками"
-    echo -e " ${C_RED}3)${C_RESET} Выход"
+    ui_ln " ${C_GRAY}0)${C_RESET} Показать системную информацию ещё раз"
+    ui_ln " ${C_GREEN}1)${C_RESET} Создать swapfile ${C_BOLD}${rec_gb}G${C_RESET} + swappiness=${DEFAULT_SWAPPINESS} + vfs_cache_pressure=${DEFAULT_VFS} ${C_DIM}(рекомендуется)${C_RESET}"
+    ui_ln " ${C_CYAN}2)${C_RESET} Создать swapfile со своими настройками"
+    ui_ln " ${C_RED}3)${C_RESET} Выход"
     echo
     read -r -p "Введите номер действия: " c
 
@@ -506,12 +524,12 @@ menu_no_swap() {
         ui_title "Создание swapfile (рекомендуется)"
         print_optimal_explanation_full
 
-        echo -e "${C_BOLD}Было:${C_RESET}"
+        ui_ln "${C_BOLD}Было:${C_RESET}"
         echo "  swap: (нет)"
         echo "  vm.swappiness: $(cat /proc/sys/vm/swappiness 2>/dev/null || echo N/A)"
         echo "  vm.vfs_cache_pressure: $(cat /proc/sys/vm/vfs_cache_pressure 2>/dev/null || echo N/A)"
         echo
-        echo -e "${C_BOLD}Будет создано:${C_RESET}"
+        ui_ln "${C_BOLD}Будет создано:${C_RESET}"
         echo "  swapfile: $swapfile"
         echo "  размер:   ${rec_gb}G (по формуле от RAM)"
         echo "  swappiness=$DEFAULT_SWAPPINESS"
@@ -540,7 +558,7 @@ menu_no_swap() {
         ui_title "Создание swapfile (свои настройки)"
 
         print_tuning_hint
-        echo -e "Рекомендуемый размер swap по RAM: ${C_BOLD}${rec_gb}G${C_RESET}"
+        ui_ln "Рекомендуемый размер swap по RAM: ${C_BOLD}${rec_gb}G${C_RESET}"
         echo
 
         read -r -p "Размер swap (ГБ) [по умолчанию ${rec_gb}]: " sz
@@ -596,14 +614,14 @@ menu_with_swap() {
     print_banner
     ui_title "Swap обнаружен"
 
-    echo -e "${C_BOLD}Текущие значения:${C_RESET}"
+    ui_ln "${C_BOLD}Текущие значения:${C_RESET}"
     swapon --show --bytes || true
     echo "vm.swappiness: $(cat /proc/sys/vm/swappiness 2>/dev/null || echo N/A)"
     echo "vm.vfs_cache_pressure: $(cat /proc/sys/vm/vfs_cache_pressure 2>/dev/null || echo N/A)"
     echo "${C_DIM}USED=0 — это нормально: swap будет использоваться только при нехватке RAM.${C_RESET}"
     echo
 
-    echo -e "${C_DIM}Рекомендуемый swap по RAM (${C_BOLD}$(human_size "$mem_bytes")${C_DIM}): ${C_BOLD}${rec_gb}G${C_RESET}"
+    ui_ln "${C_DIM}Рекомендуемый swap по RAM (${C_BOLD}$(human_size "$mem_bytes")${C_DIM}): ${C_BOLD}${rec_gb}G${C_RESET}"
     echo
 
     # Подпись для пункта 4 (в зависимости от того, есть ли swap-раздел)
@@ -614,12 +632,12 @@ menu_with_swap() {
       opt4_label="Пересоздать swapfile ${swapfile} (удалить и создать заново)"
     fi
 
-    echo -e " ${C_GRAY}0)${C_RESET} Показать системную информацию ещё раз"
-    echo -e " ${C_GREEN}1)${C_RESET} Оставить существующий swap без изменений"
-    echo -e " ${C_CYAN}2)${C_RESET} Применить оптимальные swappiness/vfs_cache_pressure (10/50) ${C_DIM}(рекомендуется для нод)${C_RESET}"
-    echo -e " ${C_CYAN}3)${C_RESET} Изменить swappiness/vfs_cache_pressure вручную"
-    echo -e " ${C_YELLOW}4)${C_RESET} ${opt4_label}"
-    echo -e " ${C_RED}5)${C_RESET} Выход"
+    ui_ln " ${C_GRAY}0)${C_RESET} Показать системную информацию ещё раз"
+    ui_ln " ${C_GREEN}1)${C_RESET} Оставить существующий swap без изменений"
+    ui_ln " ${C_CYAN}2)${C_RESET} Применить оптимальные swappiness/vfs_cache_pressure (10/50) ${C_DIM}(рекомендуется для нод)${C_RESET}"
+    ui_ln " ${C_CYAN}3)${C_RESET} Изменить swappiness/vfs_cache_pressure вручную"
+    ui_ln " ${C_YELLOW}4)${C_RESET} ${opt4_label}"
+    ui_ln " ${C_RED}5)${C_RESET} Выход"
     echo
     read -r -p "Введите номер действия: " c
 
@@ -653,7 +671,7 @@ menu_with_swap() {
 
         cur_sw="$(cat /proc/sys/vm/swappiness 2>/dev/null || echo N/A)"
         cur_vfs="$(cat /proc/sys/vm/vfs_cache_pressure 2>/dev/null || echo N/A)"
-        echo -e "${C_DIM}Сейчас: swappiness=${cur_sw}, vfs_cache_pressure=${cur_vfs}${C_RESET}"
+        ui_ln "${C_DIM}Сейчас: swappiness=${cur_sw}, vfs_cache_pressure=${cur_vfs}${C_RESET}"
         echo
 
         read -r -p "swappiness [рекомендуется ${DEFAULT_SWAPPINESS}]: " sw
@@ -695,10 +713,10 @@ menu_with_swap() {
         create_swapfile "$swapfile" "$new_sz"
 
         echo
-        echo -e "${C_BOLD}Текущие sysctl сейчас:${C_RESET} swappiness=$(cat /proc/sys/vm/swappiness 2>/dev/null || echo N/A), vfs_cache_pressure=$(cat /proc/sys/vm/vfs_cache_pressure 2>/dev/null || echo N/A)"
+        ui_ln "${C_BOLD}Текущие sysctl сейчас:${C_RESET} swappiness=$(cat /proc/sys/vm/swappiness 2>/dev/null || echo N/A), vfs_cache_pressure=$(cat /proc/sys/vm/vfs_cache_pressure 2>/dev/null || echo N/A)"
         echo "Применить оптимальные sysctl (10/50) и сохранить для перезагрузки?"
-        echo -e " ${C_GREEN}1)${C_RESET} Да"
-        echo -e " ${C_CYAN}2)${C_RESET} Нет, задам вручную"
+        ui_ln " ${C_GREEN}1)${C_RESET} Да"
+        ui_ln " ${C_CYAN}2)${C_RESET} Нет, задам вручную"
         read -r -p "Выбор [1-2]: " sc
 
         case "$sc" in
