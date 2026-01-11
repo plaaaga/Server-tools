@@ -111,7 +111,7 @@ EOF
   fi
 
   printf "%b\n\n" "${C_DIM}Универсальный менеджер swap для Ubuntu/Debian (под ноды)${C_RESET}"
-  ui_hr
+
 }
 
 # -------------------------
