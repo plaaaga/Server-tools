@@ -164,6 +164,17 @@ get_mem_bytes() { local kb; kb="$(get_mem_kb)"; echo $(( kb * 1024 )); }
 
 get_root_fstype() { findmnt -n -o FSTYPE / 2>/dev/null || echo "unknown"; }
 
+get_os_pretty() {
+  # /etc/os-release есть и в Ubuntu, и в Debian
+  if [[ -r /etc/os-release ]]; then
+    # PRETTY_NAME="Ubuntu 24.04.1 LTS"
+    . /etc/os-release
+    echo "${PRETTY_NAME:-${NAME:-Linux}}"
+  else
+    echo "Linux"
+  fi
+}
+
 is_int() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
 
 validate_range() {
@@ -295,6 +306,7 @@ print_system_info() {
   avail_bytes="$(df --output=avail -B1 / | tail -n1 | tr -d ' ')"
 
   ui_title "System info"
+  echo "System: $(get_os_pretty)"
   echo "Kernel: $(uname -sr)"
   echo "Uptime: $(uptime -p 2>/dev/null || true)"
   echo "CPU: $(awk -F: '/model name/ {gsub(/^[ \t]+/,"",$2); print $2; exit}' /proc/cpuinfo)"
@@ -322,6 +334,7 @@ print_system_info_legend() {
   cat <<'EOF'
 
 Пояснения:
+- System: дистрибутив и версия (из /etc/os-release).
 - Kernel: версия ядра Linux (влияет на поведение памяти/свапа).
 - Uptime: сколько система работает без перезагрузки.
 - CPU: модель процессора.
