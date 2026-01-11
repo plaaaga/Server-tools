@@ -664,7 +664,12 @@ menu_with_swap() {
       1)
         ui_info "Оставляю как есть."
         # (по желанию) короткая сводка
-        ui_info "Swap: $(swapon --noheadings --show=NAME,SIZE,USED 2>/dev/null | head -n1 | tr -s ' ' | sed 's/^ *//')"
+        swap_line="$(swapon --noheadings --show=NAME,SIZE,USED 2>/dev/null | head -n1 | tr -s ' ' | sed 's/^ *//')"
+if [[ -n "$swap_line" ]]; then
+  ui_info "Swap: ${swap_line}  (последнее значение — USED, т.е. сколько swap используется сейчас)"
+else
+  ui_info "Swap: (нет активного swap)"
+fi
         ui_info "vm.swappiness=$(cat /proc/sys/vm/swappiness), vm.vfs_cache_pressure=$(cat /proc/sys/vm/vfs_cache_pressure)"
         ui_pause_clear
         ui_info "Операция завершена."
