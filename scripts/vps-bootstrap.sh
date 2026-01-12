@@ -1,82 +1,34 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ==========================================
-# VPS Bootstrap (Ubuntu/Debian, apt-based)
-# ==========================================
-# Modes:
-#   --check        : analyze only (no changes)
-#   --apply        : apply changes
-#
-# Options:
-#   --install-docker=auto|yes|no   (default: auto)
-#   --prefer-compose-plugin        (replace /usr/local/bin/docker-compose with wrapper -> docker compose)
-#   --no-upgrade                   (skip full system upgrade/full-upgrade; still installs/upgrades selected packages)
-#
-# Examples:
-#   sudo bash vps-bootstrap.sh --check
-#   sudo bash vps-bootstrap.sh --apply --prefer-compose-plugin
-#   sudo bash vps-bootstrap.sh --apply --install-docker=no
-#   sudo bash vps-bootstrap.sh --apply --no-upgrade
-#
-
-MODE="check"
-INSTALL_DOCKER="auto"
-PREFER_COMPOSE_PLUGIN="no"
-DO_UPGRADE="yes"
-
-for arg in "$@"; do
-  case "$arg" in
-    --check) MODE="check" ;;
-    --apply) MODE="apply" ;;
-    --install-docker=*) INSTALL_DOCKER="${arg#*=}" ;;
-    --prefer-compose-plugin) PREFER_COMPOSE_PLUGIN="yes" ;;
-    --no-upgrade) DO_UPGRADE="no" ;;
-    *)
-      echo "Unknown argument: $arg"
-      exit 2
-      ;;
-  esac
-done
-
 export DEBIAN_FRONTEND=noninteractive
 
-# -------- pretty logs --------
-c_info="\033[1;32m"
-c_warn="\033[1;33m"
-c_err="\033[1;31m"
-c_dim="\033[2m"
-c_reset="\033[0m"
+# ---------- UI ----------
+c_info="\033[1;32m"; c_warn="\033[1;33m"; c_err="\033[1;31m"; c_dim="\033[2m"
+c_ok="\033[1;32m"; c_bad="\033[1;31m"; c_mid="\033[1;33m"; c_reset="\033[0m"
 
 log()  { echo -e "${c_info}[INFO]${c_reset} $*"; }
 warn() { echo -e "${c_warn}[WARN]${c_reset} $*"; }
 err()  { echo -e "${c_err}[ERR ]${c_reset} $*" >&2; }
 
-have_cmd() { command -v "$1" >/dev/null 2>&1; }
-dpkg_installed() { dpkg -s "$1" >/dev/null 2>&1; }
-
-need_root_apply() {
-  if [[ "$MODE" == "apply" && "${EUID}" -ne 0 ]]; then
-    err "Run apply mode as root: sudo bash $0 --apply ..."
-    exit 1
-  fi
+pause() { read -r -p "Нажми Enter, чтобы продолжить..." _; }
+confirm() {
+  local prompt="${1:-Продолжить?}"
+  read -r -p "$prompt [y/N]: " ans
+  [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]
 }
 
-run_or_plan() {
-  if [[ "$MODE" == "check" ]]; then
-    echo -e "  ${c_dim}PLAN:${c_reset} $*"
-  else
-    eval "$@"
+need_root_or_warn() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    warn "Для этого действия нужны права root. Запусти: sudo $0"
+    return 1
   fi
+  return 0
 }
 
-# -------- OS detect --------
-OS_ID="unknown"
-OS_NAME="unknown"
-OS_VER="unknown"
-OS_CODENAME=""
-
-os_detect() {
+# ---------- OS detect ----------
+OS_ID="unknown"; OS_NAME="unknown"; OS_VER="unknown"; OS_CODENAME=""
+detect_os() {
   if [[ -r /etc/os-release ]]; then
     # shellcheck disable=SC1091
     . /etc/os-release
@@ -86,12 +38,9 @@ os_detect() {
     OS_CODENAME="${VERSION_CODENAME:-}"
   fi
 }
+is_apt_os() { [[ "$OS_ID" == "ubuntu" || "$OS_ID" == "debian" ]]; }
 
-is_apt_os() {
-  [[ "$OS_ID" == "ubuntu" || "$OS_ID" == "debian" ]]
-}
-
-# -------- packages list (your list) --------
+# ---------- Base packages (your list) ----------
 BASE_PKGS=(
   ca-certificates
   apt-transport-https
@@ -115,130 +64,120 @@ BASE_PKGS=(
   coreutils
 )
 
-# -------- commands audit list --------
-# Note: some are commands from packages above; also include docker tooling.
+# ---------- Command audit list ----------
 AUDIT_CMDS=(
-  apt-get
-  curl
-  wget
-  nano
-  screen
-  tmux
-  htop
-  git
-  jq
-  unzip
-  zip
-  ip
-  ifconfig
-  dig
-  ufw
-  cat
-  docker
-  docker-compose
+  curl wget nano screen tmux htop git jq unzip zip
+  ip ifconfig dig ufw cat
+  docker docker-compose
 )
 
-# -------- holds --------
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+cmd_path() { command -v "$1" 2>/dev/null || true; }
+
+cmd_version_line() {
+  local c="$1"
+  if ! have_cmd "$c"; then echo ""; return 0; fi
+
+  local out=""
+  case "$c" in
+    docker) out="$(docker --version 2>/dev/null | head -n1 || true)" ;;
+    docker-compose) out="$(docker-compose version 2>/dev/null | head -n1 || true)" ;;
+    ufw) out="$(ufw version 2>/dev/null | head -n1 || true)" ;;
+    ip) out="$(ip -V 2>/dev/null | head -n1 || true)" ;;
+    ifconfig) out="$(ifconfig --version 2>/dev/null | head -n1 || true)" ;;
+    dig) out="$(dig -v 2>/dev/null | head -n1 || true)" ;;
+    *)
+      if "$c" --version >/dev/null 2>&1; then out="$("$c" --version 2>/dev/null | head -n1 || true)"
+      elif "$c" -V >/dev/null 2>&1; then out="$("$c" -V 2>/dev/null | head -n1 || true)"
+      elif "$c" -v >/dev/null 2>&1; then out="$("$c" -v 2>/dev/null | head -n1 || true)"
+      else out=""; fi
+      ;;
+  esac
+  echo "$out" | tr -s ' ' | sed 's/[[:space:]]*$//'
+}
+
+# ---------- Holds + version helpers ----------
 declare -A HOLDS
 load_holds() {
+  HOLDS=()
   local h
   while read -r h; do
     [[ -n "$h" ]] && HOLDS["$h"]="1"
   done < <(apt-mark showhold 2>/dev/null || true)
 }
+is_held() { [[ "${HOLDS[$1]:-}" == "1" ]]; }
 
-is_held() {
-  local p="$1"
-  [[ "${HOLDS[$p]:-}" == "1" ]]
-}
-
-# -------- version helpers --------
 installed_ver() {
   local p="$1"
   dpkg-query -W -f='${Status} ${Version}\n' "$p" 2>/dev/null | awk '/install ok installed/{print $5}' || true
 }
-
 candidate_ver() {
   local p="$1"
   apt-cache policy "$p" 2>/dev/null | awk -F': ' '/Candidate:/{print $2}' | head -n1 || true
 }
-
 ver_newer_available() {
-  local inst="$1"
-  local cand="$2"
+  local inst="$1" cand="$2"
   [[ -z "$inst" || -z "$cand" || "$cand" == "(none)" ]] && return 1
   dpkg --compare-versions "$cand" gt "$inst"
 }
 
-# -------- command version helper --------
-cmd_path() {
-  command -v "$1" 2>/dev/null || true
+# ---------- System info ----------
+show_system_info() {
+  echo
+  log "Система:"
+  echo "  OS:     $OS_NAME ($OS_ID) $OS_VER ${OS_CODENAME:+codename=$OS_CODENAME}"
+  echo "  Kernel: $(uname -r)"
+  echo "  Uptime: $(uptime -p 2>/dev/null || true)"
+  echo "  User:   $(id -un) (uid=$(id -u))"
+  echo
+  if is_apt_os; then
+    echo "  APT:    $(apt-get --version 2>/dev/null | head -n1 || true)"
+  else
+    warn "Этот скрипт рассчитан на Ubuntu/Debian (apt). Обнаружено: $OS_ID"
+  fi
+  echo
 }
 
-cmd_version_line() {
-  # Try a few common patterns; keep it short and safe.
-  local c="$1"
-  local out=""
-  if ! have_cmd "$c"; then
-    echo ""
-    return
+# ---------- Package audit ----------
+maybe_refresh_apt_lists_for_audit() {
+  is_apt_os || return 0
+
+  echo
+  log "Пакетный аудит использует 'Candidate' версии из APT."
+  echo "Если индексы пакетов давно не обновлялись, Candidate может быть неактуален."
+  if [[ "${EUID}" -ne 0 ]]; then
+    warn "Чтобы обновить индексы пакетов (apt-get update), запусти скрипт через sudo."
+    return 0
   fi
 
-  # Special cases (more reliable):
-  case "$c" in
-    docker)
-      out="$(docker --version 2>/dev/null | head -n1 || true)"
-      ;;
-    docker-compose)
-      out="$(docker-compose version 2>/dev/null | head -n1 || true)"
-      ;;
-    ufw)
-      out="$(ufw version 2>/dev/null | head -n1 || true)"
-      ;;
-    apt-get)
-      out="$(apt-get --version 2>/dev/null | head -n1 || true)"
-      ;;
-    ip)
-      out="$(ip -V 2>/dev/null | head -n1 || true)"
-      ;;
-    ifconfig)
-      out="$(ifconfig --version 2>/dev/null | head -n1 || true)"
-      ;;
-    dig)
-      out="$(dig -v 2>/dev/null | head -n1 || true)"
-      ;;
-    *)
-      # Generic fallbacks:
-      if "$c" --version >/dev/null 2>&1; then
-        out="$("$c" --version 2>/dev/null | head -n1 || true)"
-      elif "$c" -V >/dev/null 2>&1; then
-        out="$("$c" -V 2>/dev/null | head -n1 || true)"
-      elif "$c" -v >/dev/null 2>&1; then
-        out="$("$c" -v 2>/dev/null | head -n1 || true)"
-      else
-        out=""
-      fi
-      ;;
+  if confirm "Обновить индексы пакетов сейчас? (apt-get update)"; then
+    apt-get update -y
+  else
+    log "Ок, показываю данные без apt-get update."
+  fi
+}
+
+color_status_pkg() {
+  local s="$1"
+  case "$s" in
+    OK) echo -e "${c_ok}${s}${c_reset}" ;;
+    MISSING) echo -e "${c_bad}${s}${c_reset}" ;;
+    UPGRADABLE) echo -e "${c_mid}${s}${c_reset}" ;;
+    HELD) echo -e "${c_mid}${s}${c_reset}" ;;
+    NO-CANDIDATE) echo -e "${c_mid}${s}${c_reset}" ;;
+    *) echo "$s" ;;
   esac
-
-  # Normalize whitespace a bit:
-  echo "$out" | tr -s ' ' | sed 's/[[:space:]]*$//'
 }
 
-# -------- reports --------
-print_header() {
-  echo
-  log "Mode: $MODE | Install Docker: $INSTALL_DOCKER | Prefer compose plugin: $PREFER_COMPOSE_PLUGIN | Upgrade: $DO_UPGRADE"
-  log "OS: $OS_NAME ($OS_ID) $OS_VER ${OS_CODENAME:+codename=$OS_CODENAME}"
-  echo
-}
+show_package_audit() {
+  is_apt_os || { warn "Пакетный аудит доступен только для Ubuntu/Debian (apt)."; return; }
+  [[ "${EUID}" -eq 0 ]] && load_holds || true
 
-report_pkg_audit() {
-  echo
-  log "=== Package audit (installed vs candidate) ==="
-  echo -e "  ${c_dim}Note:${c_reset} In --check mode, candidate versions may be stale if apt lists are old."
-  echo
+  local cnt_ok=0 cnt_missing=0 cnt_upg=0 cnt_held=0 cnt_noc=0
+  local missing_list=() upg_list=() held_list=()
 
+  echo
+  log "Пакетный аудит (installed vs candidate):"
   printf "  %-24s %-16s %-16s %-14s\n" "PACKAGE" "INSTALLED" "CANDIDATE" "STATUS"
   printf "  %-24s %-16s %-16s %-14s\n" "------------------------" "----------------" "----------------" "--------------"
 
@@ -247,241 +186,400 @@ report_pkg_audit() {
     inst="$(installed_ver "$p")"
     cand="$(candidate_ver "$p")"
 
-    if is_held "$p"; then
+    status="OK"
+    if [[ "${EUID}" -eq 0 ]] && is_held "$p"; then
       status="HELD"
+      ((cnt_held++)); held_list+=("$p")
     elif [[ -z "$inst" ]]; then
       status="MISSING"
+      ((cnt_missing++)); missing_list+=("$p")
     elif [[ -z "$cand" || "$cand" == "(none)" ]]; then
       status="NO-CANDIDATE"
+      ((cnt_noc++))
     elif ver_newer_available "$inst" "$cand"; then
       status="UPGRADABLE"
+      ((cnt_upg++)); upg_list+=("$p")
     else
-      status="OK"
+      ((cnt_ok++))
     fi
 
     [[ -z "$inst" ]] && inst="(none)"
     [[ -z "$cand" ]] && cand="(unknown)"
-
-    printf "  %-24s %-16s %-16s %-14s\n" "$p" "$inst" "$cand" "$status"
+    printf "  %-24s %-16s %-16s %-14b\n" "$p" "$inst" "$cand" "$(color_status_pkg "$status")"
   done
+
+  echo
+  log "Сводка пакетов: OK=${cnt_ok}, UPGRADABLE=${cnt_upg}, MISSING=${cnt_missing}, HELD=${cnt_held}, NO-CANDIDATE=${cnt_noc}"
+
+  # Save for "plan" (global via echo + export-like approach not needed; we'll compute plan separately below)
+  # But we can print compact helpful hints:
+  if ((cnt_missing > 0)); then
+    echo "  - Не установлены: ${missing_list[*]}"
+  fi
+  if ((cnt_upg > 0)); then
+    echo "  - Есть обновления: ${upg_list[*]}"
+  fi
+  if ((cnt_held > 0)); then
+    echo "  - На hold: ${held_list[*]}"
+  fi
+  echo
 }
 
-report_cmd_audit() {
+# ---------- Command audit ----------
+color_status_cmd() {
+  local s="$1"
+  case "$s" in
+    FOUND) echo -e "${c_ok}${s}${c_reset}" ;;
+    MISSING) echo -e "${c_bad}${s}${c_reset}" ;;
+    *) echo "$s" ;;
+  esac
+}
+
+show_command_audit() {
+  local cnt_found=0 cnt_missing=0
+  local missing_cmds=()
+
   echo
-  log "=== Command audit (installed / not installed) ==="
-  printf "  %-18s %-8s %-28s %s\n" "COMMAND" "STATUS" "PATH" "VERSION"
-  printf "  %-18s %-8s %-28s %s\n" "------------------" "--------" "----------------------------" "------------------------------"
+  log "Команды и версии:"
+  printf "  %-16s %-8s %-28s %s\n" "COMMAND" "STATUS" "PATH" "VERSION"
+  printf "  %-16s %-8s %-28s %s\n" "----------------" "--------" "----------------------------" "------------------------------"
 
   local c p v
   for c in "${AUDIT_CMDS[@]}"; do
     if have_cmd "$c"; then
+      ((cnt_found++))
       p="$(cmd_path "$c")"
       v="$(cmd_version_line "$c")"
       [[ -z "$v" ]] && v="(version n/a)"
-      printf "  %-18s %-8s %-28s %s\n" "$c" "FOUND" "$p" "$v"
+      printf "  %-16s %-8b %-28s %s\n" "$c" "$(color_status_cmd FOUND)" "$p" "$v"
     else
-      printf "  %-18s %-8s %-28s %s\n" "$c" "MISSING" "-" "-"
+      ((cnt_missing++))
+      missing_cmds+=("$c")
+      printf "  %-16s %-8b %-28s %s\n" "$c" "$(color_status_cmd MISSING)" "-" "-"
     fi
   done
 
-  # Extra: plugin compose audit (docker compose)
   echo
-  if have_cmd docker; then
-    if docker compose version >/dev/null 2>&1; then
-      echo "  docker compose: $(docker compose version 2>/dev/null | tr -s ' ')"
-    else
-      echo "  docker compose: NOT FOUND (plugin not available)"
-    fi
-  else
-    echo "  docker compose: (docker missing)"
+  log "Сводка команд: FOUND=${cnt_found}, MISSING=${cnt_missing}"
+  if ((cnt_missing > 0)); then
+    echo "  - Отсутствуют команды: ${missing_cmds[*]}"
   fi
+  echo
 }
 
-report_docker_state() {
+# ---------- Docker/Compose details + risks ----------
+show_docker_details() {
   echo
-  log "=== Docker / Compose audit (detailed) ==="
+  log "Docker/Compose (дополнительно):"
+
+  local has_docker="no"
+  local has_plugin="no"
+  local has_hyphen="no"
+  local hyphen_path=""
+  local has_manual_hyphen="no"
 
   if have_cmd docker; then
-    echo "  docker: $(command -v docker)"
+    has_docker="yes"
+    echo "  docker: OK"
     docker version 2>/dev/null | sed 's/^/  /' || true
   else
-    echo "  docker: NOT FOUND"
+    echo "  Docker отсутствует (docker: NOT FOUND)"
   fi
 
-  echo
+  if have_cmd docker; then
+    if docker compose version >/dev/null 2>&1; then
+      has_plugin="yes"
+      echo
+      echo "  docker compose: $(docker compose version 2>/dev/null | tr -s ' ')"
+    else
+      echo
+      echo "  docker compose: NOT FOUND (plugin)"
+    fi
+  fi
+
   if have_cmd docker-compose; then
-    echo "  docker-compose: $(command -v docker-compose)"
+    has_hyphen="yes"
+    hyphen_path="$(command -v docker-compose)"
+    echo "  docker-compose: $hyphen_path"
     docker-compose version 2>/dev/null | sed 's/^/  /' || true
-  else
-    echo "  docker-compose: NOT FOUND"
+    if [[ "$hyphen_path" == "/usr/local/bin/docker-compose" ]]; then
+      has_manual_hyphen="yes"
+    fi
   fi
 
   echo
-  log "APT policy (docker.io / docker-ce / docker-compose / docker-compose-plugin):"
-  apt-cache policy docker.io docker-ce docker-compose docker-compose-plugin 2>/dev/null | sed -n '1,120p' | sed 's/^/  /' || true
+  log "Проверка рисков/конфликтов:"
+  local any_risk="no"
+
+  if [[ "$has_docker" == "yes" && "$has_plugin" == "yes" && "$has_hyphen" == "yes" && "$has_manual_hyphen" == "yes" ]]; then
+    any_risk="yes"
+    warn "Найден ручной /usr/local/bin/docker-compose. Он может отличаться по версии от 'docker compose' (plugin)."
+    echo "  Подсказка: в пункте 4 можно включить обёртку docker-compose -> docker compose."
+  fi
+
+  if [[ "$has_docker" == "yes" && "$has_plugin" == "no" ]]; then
+    any_risk="yes"
+    warn "Docker есть, но нет Compose v2 plugin (docker compose)."
+    echo "  Подсказка: установить docker-compose-plugin (пункт 4 или пункт 3)."
+  fi
+
+  if [[ "$any_risk" == "no" ]]; then
+    echo "  OK: явных конфликтов Compose не видно."
+  fi
+
+  echo
 }
 
-# -------- apt actions --------
-apt_update_upgrade() {
-  if ! is_apt_os; then
-    warn "Non Ubuntu/Debian OS detected ($OS_ID). This script supports apt-based systems only."
+# ---------- Plan builder (compact, actionable) ----------
+show_action_plan() {
+  # This is heuristic: based on visible facts, suggest which menu items to run.
+  echo
+  log "План действий (подсказки):"
+
+  local suggest_update="no"
+  local suggest_pkgs="no"
+  local suggest_docker="no"
+  local suggest_wrap="no"
+
+  # If any base package missing or upgradable: suggest пункт 3.
+  # We'll compute quickly here without storing from audit: recompute lightweight.
+  local p inst cand
+  for p in "${BASE_PKGS[@]}"; do
+    inst="$(installed_ver "$p")"
+    cand="$(candidate_ver "$p")"
+    if [[ -z "$inst" ]]; then suggest_pkgs="yes"; break; fi
+    if [[ -n "$inst" && -n "$cand" && "$cand" != "(none)" ]] && dpkg --compare-versions "$cand" gt "$inst" 2>/dev/null; then
+      suggest_pkgs="yes"; break
+    fi
+  done
+
+  # System update suggestion is intentionally conservative: only if user wants system-wide upgrade.
+  # We'll suggest if script runs as root and apt lists are probably stale? Not reliable.
+  # So we phrase it as optional.
+  suggest_update="optional"
+
+  # Docker suggestion:
+  if ! have_cmd docker; then
+    suggest_docker="yes"
+  fi
+
+  # Wrap suggestion:
+  if have_cmd docker-compose; then
+    local hp; hp="$(command -v docker-compose)"
+    if [[ "$hp" == "/usr/local/bin/docker-compose" ]]; then
+      suggest_wrap="yes"
+    fi
+  fi
+
+  if [[ "$suggest_update" == "optional" ]]; then
+    echo "  - Пункт 2 (обновление системы): опционально, если хочешь обновить ВСЮ систему."
+  fi
+  if [[ "$suggest_pkgs" == "yes" ]]; then
+    echo "  - Пункт 3 (базовые пакеты): рекомендуется (есть missing/upgradable в списке базовых пакетов)."
+  else
+    echo "  - Пункт 3 (базовые пакеты): похоже, всё ок (по списку базовых пакетов)."
+  fi
+  if [[ "$suggest_docker" == "yes" ]]; then
+    echo "  - Пункт 4 (Docker): Docker не найден — установи Docker CE, если нужен."
+  else
+    echo "  - Пункт 4 (Docker): Docker найден."
+  fi
+  if [[ "$suggest_wrap" == "yes" ]]; then
+    echo "  - Пункт 4 → обёртка compose: рекомендуется (есть /usr/local/bin/docker-compose)."
+  fi
+  echo
+}
+
+# ---------- Menu action 1 ----------
+action_1_audit_everything() {
+  show_command_audit
+  show_docker_details
+  if is_apt_os; then
+    maybe_refresh_apt_lists_for_audit
+    show_package_audit
+  fi
+  show_action_plan
+}
+
+# ---------- Menu action 2 ----------
+update_system() {
+  is_apt_os || { err "Не apt-система. Обновление не поддерживается."; return; }
+  need_root_or_warn || return
+
+  echo
+  log "Обновление системы (apt update/upgrade/full-upgrade/autoremove)."
+  warn "Это может обновить многие пакеты системы."
+  if ! confirm "Запустить обновление системы?"; then
+    log "Отменено."
     return
   fi
 
-  if [[ "$MODE" == "apply" ]]; then
-    log "Running apt-get update..."
-    apt-get update -y
-  else
-    echo -e "  ${c_dim}PLAN:${c_reset} apt-get update -y"
+  log "apt-get update..."
+  apt-get update -y
+
+  log "apt-get upgrade..."
+  apt-get upgrade -y
+
+  log "apt-get full-upgrade..."
+  apt-get full-upgrade -y
+
+  log "apt-get autoremove..."
+  apt-get autoremove -y
+
+  if [[ -f /var/run/reboot-required ]]; then
+    warn "Рекомендуется перезагрузка: найден /var/run/reboot-required"
   fi
 
-  if [[ "$DO_UPGRADE" == "yes" ]]; then
-    run_or_plan "apt-get upgrade -y"
-    run_or_plan "apt-get full-upgrade -y"
-    run_or_plan "apt-get autoremove -y"
-  else
-    warn "Skipping full system upgrade (--no-upgrade). Will still install/upgrade selected packages."
-  fi
+  log "Готово."
 }
 
+# ---------- Menu action 3 ----------
 install_or_upgrade_base_pkgs() {
-  if ! is_apt_os; then return; fi
-  log "Installing/upgrading base packages (your list)..."
-  run_or_plan "apt-get install -y ${BASE_PKGS[*]}"
-}
+  is_apt_os || { err "Не apt-система. Установка пакетов не поддерживается."; return; }
+  need_root_or_warn || return
 
-# -------- Docker install/migrate --------
-docker_ce_installed() { dpkg_installed docker-ce; }
-docker_io_installed() { dpkg_installed docker.io; }
-
-ensure_docker_ce_repo() {
-  if ! is_apt_os; then return; fi
-  if [[ "$OS_ID" != "ubuntu" && "$OS_ID" != "debian" ]]; then return; fi
-  if [[ -z "$OS_CODENAME" ]]; then
-    err "Cannot detect OS codename (e.g. jammy/noble/bookworm). Check /etc/os-release."
-    exit 1
+  echo
+  log "Установка/обновление базовых пакетов:"
+  echo "  ${BASE_PKGS[*]}"
+  if ! confirm "Продолжить установку/обновление?"; then
+    log "Отменено."
+    return
   fi
 
-  run_or_plan "install -m 0755 -d /etc/apt/keyrings"
-  run_or_plan "curl -fsSL https://download.docker.com/linux/${OS_ID}/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg"
-  run_or_plan "chmod a+r /etc/apt/keyrings/docker.gpg"
+  apt-get update -y
+  apt-get install -y "${BASE_PKGS[@]}"
+  log "Готово."
+}
+
+# ---------- Docker install ----------
+docker_ce_installed() { dpkg -s docker-ce >/dev/null 2>&1; }
+
+ensure_docker_repo() {
+  need_root_or_warn || return 1
+  is_apt_os || return 1
+
+  if [[ -z "$OS_CODENAME" ]]; then
+    err "Не удалось определить codename (jammy/noble/bookworm). Проверь /etc/os-release."
+    return 1
+  fi
+
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL "https://download.docker.com/linux/${OS_ID}/gpg" | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  chmod a+r /etc/apt/keyrings/docker.gpg
 
   local arch
   arch="$(dpkg --print-architecture)"
 
-  run_or_plan "cat > /etc/apt/sources.list.d/docker.list <<EOF
+  cat >/etc/apt/sources.list.d/docker.list <<EOF
 deb [arch=${arch} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${OS_ID} ${OS_CODENAME} stable
-EOF"
+EOF
 
-  if [[ "$MODE" == "apply" ]]; then
-    apt-get update -y
-  else
-    echo -e "  ${c_dim}PLAN:${c_reset} apt-get update -y"
-  fi
+  apt-get update -y
 }
 
-install_or_migrate_docker() {
-  if ! is_apt_os; then return; fi
+wrap_docker_compose() {
+  need_root_or_warn || return
 
-  if [[ "$INSTALL_DOCKER" == "no" ]]; then
-    log "Docker installation/migration disabled (--install-docker=no)."
-    return
-  fi
-
-  if docker_ce_installed; then
-    log "docker-ce already installed. Upgrading docker packages (if updates available)..."
-    run_or_plan "apt-get install -y --only-upgrade docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || true"
-    return
-  fi
-
-  if docker_io_installed; then
-    warn "Detected docker.io from distro repo. Recommended to migrate to Docker CE to avoid containerd/compose conflicts."
-  fi
-
-  if [[ "$INSTALL_DOCKER" == "auto" || "$INSTALL_DOCKER" == "yes" ]]; then
-    log "Installing Docker CE (official repo) + Compose v2 plugin..."
-    run_or_plan "apt-get remove -y docker.io docker-compose docker-doc podman-docker containerd runc || true"
-    ensure_docker_ce_repo
-    run_or_plan "apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"
-    run_or_plan "systemctl enable docker"
-    run_or_plan "systemctl start docker"
-  fi
-}
-
-# -------- Compose unification --------
-prefer_compose_plugin() {
   local p=""
-  if have_cmd docker-compose; then
-    p="$(command -v docker-compose)"
-  fi
+  if have_cmd docker-compose; then p="$(command -v docker-compose)"; fi
 
   if [[ -z "$p" ]]; then
-    log "No docker-compose binary detected. OK."
+    warn "docker-compose не найден — обёртка не требуется."
     return
   fi
 
-  if [[ "$p" == "/usr/local/bin/docker-compose" ]]; then
-    warn "Found manually installed docker-compose at /usr/local/bin/docker-compose (can differ from plugin 'docker compose')."
-    if [[ "$PREFER_COMPOSE_PLUGIN" == "yes" ]]; then
-      log "Replacing it with wrapper to 'docker compose' (backup will be created)."
-      run_or_plan "mv /usr/local/bin/docker-compose /usr/local/bin/docker-compose.bak.$(date +%F_%H%M%S)"
-      run_or_plan "cat > /usr/local/bin/docker-compose <<'EOF'
-#!/usr/bin/env bash
-exec docker compose \"\$@\"
-EOF"
-      run_or_plan "chmod +x /usr/local/bin/docker-compose"
-    else
-      warn "Leaving it as-is. Run with --prefer-compose-plugin to unify."
-    fi
-  else
-    warn "docker-compose is present at: $p (not /usr/local/bin). Leaving as-is."
+  if [[ "$p" != "/usr/local/bin/docker-compose" ]]; then
+    warn "docker-compose найден по пути: $p"
+    warn "Я не буду трогать его автоматически (не /usr/local/bin)."
+    return
   fi
+
+  log "Найден ручной /usr/local/bin/docker-compose. Сделаем обёртку на 'docker compose'."
+  if ! confirm "Заменить docker-compose на обёртку (с бэкапом)?"; then
+    log "Отменено."
+    return
+  fi
+
+  mv /usr/local/bin/docker-compose "/usr/local/bin/docker-compose.bak.$(date +%F_%H%M%S)"
+  cat >/usr/local/bin/docker-compose <<'EOF'
+#!/usr/bin/env bash
+exec docker compose "$@"
+EOF
+  chmod +x /usr/local/bin/docker-compose
+  log "Готово. Теперь 'docker-compose' будет вызывать 'docker compose'."
 }
 
-# -------- Main --------
-main() {
-  need_root_apply
-  os_detect
-
-  print_header
-
-  if ! is_apt_os; then
-    warn "This script currently supports Ubuntu/Debian (apt). Detected: $OS_ID"
-    exit 0
-  fi
-
-  load_holds
-
-  # Audits before changes
-  report_pkg_audit
-  report_cmd_audit
-  report_docker_state
+install_docker_menu() {
+  is_apt_os || { err "Не apt-система. Установка Docker не поддерживается."; return; }
+  need_root_or_warn || return
 
   echo
-  log "=== Planned/Applied actions ==="
-  apt_update_upgrade
-  install_or_upgrade_base_pkgs
-  install_or_migrate_docker
-  prefer_compose_plugin
-
-  # Audits after changes (useful in --apply; harmless in --check)
-  echo
-  log "=== Final audit ==="
-  load_holds
-  report_pkg_audit
-  report_cmd_audit
-  report_docker_state
-
-  echo
-  if [[ "$MODE" == "check" ]]; then
-    log "Done (check mode): no changes were applied."
-  else
-    log "Done (apply mode)."
-    if [[ -f /var/run/reboot-required ]]; then
-      warn "Reboot recommended: /var/run/reboot-required exists."
-      sed 's/^/  /' /var/run/reboot-required 2>/dev/null || true
+  log "Установка Docker CE из официального репозитория Docker."
+  warn "Если сейчас стоят docker.io/containerd/runc из репозиториев Ubuntu/Debian — возможны конфликты. Скрипт удалит конфликтующие пакеты."
+  if docker_ce_installed; then
+    log "docker-ce уже установлен."
+    if confirm "Обновить docker-ce и плагины до доступных версий?"; then
+      apt-get update -y
+      apt-get install -y --only-upgrade docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || true
+      log "Обновление Docker выполнено."
     fi
+  else
+    if ! confirm "Продолжить установку Docker CE?"; then
+      log "Отменено."
+      return
+    fi
+
+    apt-get remove -y docker.io docker-compose docker-doc podman-docker containerd runc || true
+    ensure_docker_repo
+    apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    systemctl enable docker
+    systemctl start docker
+    log "Docker установлен и запущен."
   fi
+
+  echo
+  log "Опции Compose:"
+  echo "  1) Ничего не делать"
+  echo "  2) Сделать обёртку: docker-compose -> docker compose (рекомендуется, если есть /usr/local/bin/docker-compose)"
+  echo
+  read -r -p "Выбери (1-2): " sub
+  case "$sub" in
+    2) wrap_docker_compose ;;
+    *) log "Пропущено." ;;
+  esac
+}
+
+# ---------- Main menu ----------
+menu_loop() {
+  while true; do
+    echo
+    echo "=============================="
+    echo " VPS Bootstrap Menu"
+    echo "=============================="
+    echo "1) Аудит: команды/версии + Docker + пакетный аудит + план действий"
+    echo "2) Обновить систему (apt update/upgrade/full-upgrade)"
+    echo "3) Установить/обновить базовые команды (пакеты)"
+    echo "4) Установить/обновить Docker CE (+ опция обёртки compose)"
+    echo "5) Выход"
+    echo
+    read -r -p "Выбери пункт (1-5): " choice
+
+    case "$choice" in
+      1) action_1_audit_everything; pause ;;
+      2) update_system; pause ;;
+      3) install_or_upgrade_base_pkgs; pause ;;
+      4) install_docker_menu; pause ;;
+      5) clear; exit 0 ;;
+      *) warn "Неверный выбор."; pause ;;
+    esac
+  done
+}
+
+main() {
+  detect_os
+  clear
+  show_system_info
+  menu_loop
 }
 
 main
