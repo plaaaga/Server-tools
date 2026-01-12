@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
 export DEBIAN_FRONTEND=noninteractive
 
-# ---------- UI ----------
+# ========= UI =========
 c_info="\033[1;32m"; c_warn="\033[1;33m"; c_err="\033[1;31m"; c_dim="\033[2m"
 c_ok="\033[1;32m"; c_bad="\033[1;31m"; c_mid="\033[1;33m"; c_reset="\033[0m"
 
@@ -26,7 +25,7 @@ need_root_or_warn() {
   return 0
 }
 
-# ---------- OS detect ----------
+# ========= OS detect =========
 OS_ID="unknown"; OS_NAME="unknown"; OS_VER="unknown"; OS_CODENAME=""
 detect_os() {
   if [[ -r /etc/os-release ]]; then
@@ -40,7 +39,12 @@ detect_os() {
 }
 is_apt_os() { [[ "$OS_ID" == "ubuntu" || "$OS_ID" == "debian" ]]; }
 
-# ---------- Base packages (your list) ----------
+# ========= State =========
+USER_MODE="novice"           # novice|advanced
+DID_APT_UPDATE="no"
+DID_SYS_UPGRADE="no"
+
+# ========= Packages / commands =========
 BASE_PKGS=(
   ca-certificates
   apt-transport-https
@@ -64,7 +68,6 @@ BASE_PKGS=(
   coreutils
 )
 
-# ---------- Command audit list ----------
 AUDIT_CMDS=(
   curl wget nano screen tmux htop git jq unzip zip
   ip ifconfig dig ufw cat
@@ -96,7 +99,7 @@ cmd_version_line() {
   echo "$out" | tr -s ' ' | sed 's/[[:space:]]*$//'
 }
 
-# ---------- Holds + version helpers ----------
+# ========= Holds + versions =========
 declare -A HOLDS
 load_holds() {
   HOLDS=()
@@ -121,7 +124,7 @@ ver_newer_available() {
   dpkg --compare-versions "$cand" gt "$inst"
 }
 
-# ---------- System info ----------
+# ========= System info =========
 show_system_info() {
   echo
   log "Система:"
@@ -129,34 +132,17 @@ show_system_info() {
   echo "  Kernel: $(uname -r)"
   echo "  Uptime: $(uptime -p 2>/dev/null || true)"
   echo "  User:   $(id -un) (uid=$(id -u))"
+  echo "  Mode:   ${USER_MODE}"
   echo
   if is_apt_os; then
     echo "  APT:    $(apt-get --version 2>/dev/null | head -n1 || true)"
   else
-    warn "Этот скрипт рассчитан на Ubuntu/Debian (apt). Обнаружено: $OS_ID"
+    warn "Скрипт рассчитан на Ubuntu/Debian (apt). Обнаружено: $OS_ID"
   fi
   echo
 }
 
-# ---------- Package audit ----------
-maybe_refresh_apt_lists_for_audit() {
-  is_apt_os || return 0
-
-  echo
-  log "Пакетный аудит использует 'Candidate' версии из APT."
-  echo "Если индексы пакетов давно не обновлялись, Candidate может быть неактуален."
-  if [[ "${EUID}" -ne 0 ]]; then
-    warn "Чтобы обновить индексы пакетов (apt-get update), запусти скрипт через sudo."
-    return 0
-  fi
-
-  if confirm "Обновить индексы пакетов сейчас? (apt-get update)"; then
-    apt-get update -y
-  else
-    log "Ок, показываю данные без apt-get update."
-  fi
-}
-
+# ========= Audit helpers =========
 color_status_pkg() {
   local s="$1"
   case "$s" in
@@ -167,6 +153,122 @@ color_status_pkg() {
     NO-CANDIDATE) echo -e "${c_mid}${s}${c_reset}" ;;
     *) echo "$s" ;;
   esac
+}
+
+color_status_cmd() {
+  local s="$1"
+  case "$s" in
+    FOUND) echo -e "${c_ok}${s}${c_reset}" ;;
+    MISSING) echo -e "${c_bad}${s}${c_reset}" ;;
+    *) echo "$s" ;;
+  esac
+}
+
+maybe_refresh_apt_lists_for_audit() {
+  is_apt_os || return 0
+  echo
+  log "Пакетный аудит использует 'Candidate' версии из APT."
+  echo "Если индексы пакетов давно не обновлялись, Candidate может быть неактуален."
+
+  if [[ "${EUID}" -ne 0 ]]; then
+    warn "Чтобы обновить индексы пакетов (apt-get update), запусти скрипт через sudo."
+    return 0
+  fi
+
+  if confirm "Обновить индексы пакетов сейчас? (apt-get update)"; then
+    apt-get update -y
+    DID_APT_UPDATE="yes"
+  else
+    log "Ок, показываю данные без apt-get update."
+  fi
+}
+
+show_command_audit() {
+  local cnt_found=0 cnt_missing=0
+  local missing_cmds=()
+
+  echo
+  log "Команды и версии:"
+  printf "  %-16s %-8s %-28s %s\n" "COMMAND" "STATUS" "PATH" "VERSION"
+  printf "  %-16s %-8s %-28s %s\n" "----------------" "--------" "----------------------------" "------------------------------"
+
+  local c p v
+  for c in "${AUDIT_CMDS[@]}"; do
+    if have_cmd "$c"; then
+      ((cnt_found+=1))
+      p="$(cmd_path "$c")"
+      v="$(cmd_version_line "$c")"
+      [[ -z "$v" ]] && v="(version n/a)"
+      printf "  %-16s %-8b %-28s %s\n" "$c" "$(color_status_cmd FOUND)" "$p" "$v"
+    else
+      ((cnt_missing+=1))
+      missing_cmds+=("$c")
+      printf "  %-16s %-8b %-28s %s\n" "$c" "$(color_status_cmd MISSING)" "-" "-"
+    fi
+  done
+
+  echo
+  log "Сводка команд: FOUND=${cnt_found}, MISSING=${cnt_missing}"
+  if ((cnt_missing > 0)); then
+    echo "  - Отсутствуют команды: ${missing_cmds[*]}"
+  fi
+  echo
+}
+
+show_docker_details() {
+  echo
+  log "Docker/Compose (дополнительно):"
+
+  local has_docker="no" has_plugin="no" has_hyphen="no"
+  local hyphen_path="" has_manual_hyphen="no"
+
+  if have_cmd docker; then
+    has_docker="yes"
+    echo "  docker: OK"
+    docker version 2>/dev/null | sed 's/^/  /' || true
+  else
+    echo "  Docker отсутствует (docker: NOT FOUND)"
+  fi
+
+  if have_cmd docker; then
+    if docker compose version >/dev/null 2>&1; then
+      has_plugin="yes"
+      echo
+      echo "  docker compose: $(docker compose version 2>/dev/null | tr -s ' ')"
+    else
+      echo
+      echo "  docker compose: NOT FOUND (plugin)"
+    fi
+  fi
+
+  if have_cmd docker-compose; then
+    has_hyphen="yes"
+    hyphen_path="$(command -v docker-compose)"
+    echo "  docker-compose: $hyphen_path"
+    docker-compose version 2>/dev/null | sed 's/^/  /' || true
+    [[ "$hyphen_path" == "/usr/local/bin/docker-compose" ]] && has_manual_hyphen="yes"
+  fi
+
+  echo
+  log "Проверка рисков/конфликтов:"
+  local any_risk="no"
+
+  if [[ "$has_docker" == "yes" && "$has_plugin" == "yes" && "$has_hyphen" == "yes" && "$has_manual_hyphen" == "yes" ]]; then
+    any_risk="yes"
+    warn "Найден ручной /usr/local/bin/docker-compose. Он может отличаться по версии от 'docker compose' (plugin)."
+    echo "  Подсказка: в пункте Docker можно включить обёртку docker-compose -> docker compose."
+  fi
+
+  if [[ "$has_docker" == "yes" && "$has_plugin" == "no" ]]; then
+    any_risk="yes"
+    warn "Docker есть, но нет Compose v2 plugin (docker compose)."
+    echo "  Подсказка: установить docker-compose-plugin (через пункт Docker или пакеты)."
+  fi
+
+  if [[ "$any_risk" == "no" ]]; then
+    echo "  OK: явных конфликтов Compose не видно."
+  fi
+  echo
 }
 
 show_package_audit() {
@@ -210,177 +312,38 @@ show_package_audit() {
 
   echo
   log "Сводка пакетов: OK=${cnt_ok}, UPGRADABLE=${cnt_upg}, MISSING=${cnt_missing}, HELD=${cnt_held}, NO-CANDIDATE=${cnt_noc}"
-  if ((cnt_missing > 0)); then
-    echo "  - Не установлены: ${missing_list[*]}"
-  fi
-  if ((cnt_upg > 0)); then
-    echo "  - Есть обновления: ${upg_list[*]}"
-  fi
-  if ((cnt_held > 0)); then
-    echo "  - На hold: ${held_list[*]}"
-  fi
+  if ((cnt_missing > 0)); then echo "  - Не установлены: ${missing_list[*]}"; fi
+  if ((cnt_upg > 0)); then echo "  - Есть обновления: ${upg_list[*]}"; fi
+  if ((cnt_held > 0)); then echo "  - На hold: ${held_list[*]}"; fi
   echo
 }
 
-# ---------- Command audit ----------
-color_status_cmd() {
-  local s="$1"
-  case "$s" in
-    FOUND) echo -e "${c_ok}${s}${c_reset}" ;;
-    MISSING) echo -e "${c_bad}${s}${c_reset}" ;;
-    *) echo "$s" ;;
-  esac
-}
-
-show_command_audit() {
-  local cnt_found=0 cnt_missing=0
-  local missing_cmds=()
-
-  echo
-  log "Команды и версии:"
-  printf "  %-16s %-8s %-28s %s\n" "COMMAND" "STATUS" "PATH" "VERSION"
-  printf "  %-16s %-8s %-28s %s\n" "----------------" "--------" "----------------------------" "------------------------------"
-
-  local c p v
-  for c in "${AUDIT_CMDS[@]}"; do
-    if have_cmd "$c"; then
-      ((cnt_found+=1))
-      p="$(cmd_path "$c")"
-      v="$(cmd_version_line "$c")"
-      [[ -z "$v" ]] && v="(version n/a)"
-      printf "  %-16s %-8b %-28s %s\n" "$c" "$(color_status_cmd FOUND)" "$p" "$v"
-    else
-      ((cnt_missing+=1))
-      missing_cmds+=("$c")
-      printf "  %-16s %-8b %-28s %s\n" "$c" "$(color_status_cmd MISSING)" "-" "-"
-    fi
-  done
-
-  echo
-  log "Сводка команд: FOUND=${cnt_found}, MISSING=${cnt_missing}"
-  if ((cnt_missing > 0)); then
-    echo "  - Отсутствуют команды: ${missing_cmds[*]}"
-  fi
-  echo
-}
-
-# ---------- Docker/Compose details + risks ----------
-show_docker_details() {
-  echo
-  log "Docker/Compose (дополнительно):"
-
-  local has_docker="no"
-  local has_plugin="no"
-  local has_hyphen="no"
-  local hyphen_path=""
-  local has_manual_hyphen="no"
-
-  if have_cmd docker; then
-    has_docker="yes"
-    echo "  docker: OK"
-    docker version 2>/dev/null | sed 's/^/  /' || true
-  else
-    echo "  Docker отсутствует (docker: NOT FOUND)"
-  fi
-
-  if have_cmd docker; then
-    if docker compose version >/dev/null 2>&1; then
-      has_plugin="yes"
-      echo
-      echo "  docker compose: $(docker compose version 2>/dev/null | tr -s ' ')"
-    else
-      echo
-      echo "  docker compose: NOT FOUND (plugin)"
-    fi
-  fi
-
-  if have_cmd docker-compose; then
-    has_hyphen="yes"
-    hyphen_path="$(command -v docker-compose)"
-    echo "  docker-compose: $hyphen_path"
-    docker-compose version 2>/dev/null | sed 's/^/  /' || true
-    if [[ "$hyphen_path" == "/usr/local/bin/docker-compose" ]]; then
-      has_manual_hyphen="yes"
-    fi
-  fi
-
-  echo
-  log "Проверка рисков/конфликтов:"
-  local any_risk="no"
-
-  if [[ "$has_docker" == "yes" && "$has_plugin" == "yes" && "$has_hyphen" == "yes" && "$has_manual_hyphen" == "yes" ]]; then
-    any_risk="yes"
-    warn "Найден ручной /usr/local/bin/docker-compose. Он может отличаться по версии от 'docker compose' (plugin)."
-    echo "  Подсказка: в пункте 4 можно включить обёртку docker-compose -> docker compose."
-  fi
-
-  if [[ "$has_docker" == "yes" && "$has_plugin" == "no" ]]; then
-    any_risk="yes"
-    warn "Docker есть, но нет Compose v2 plugin (docker compose)."
-    echo "  Подсказка: установить docker-compose-plugin (пункт 4 или пункт 3)."
-  fi
-
-  if [[ "$any_risk" == "no" ]]; then
-    echo "  OK: явных конфликтов Compose не видно."
-  fi
-
-  echo
-}
-
-# ---------- Plan builder ----------
 show_action_plan() {
   echo
-  log "План действий (подсказки):"
+  log "Подсказка по порядку действий:"
 
-  local suggest_pkgs="no"
-  local suggest_docker="no"
-  local suggest_wrap="no"
+  if [[ "$USER_MODE" == "novice" ]]; then
+    echo "  Рекомендуемый порядок: (1) Аудит → (2) Обновить систему → (3) Установить пакеты → (4) Docker (если нужен)."
+  else
+    echo "  Рекомендуемый порядок: apt update → (upgrade/full-upgrade по необходимости) → базовые пакеты → Docker."
+  fi
 
-  local p inst cand
-  for p in "${BASE_PKGS[@]}"; do
-    inst="$(installed_ver "$p")"
-    cand="$(candidate_ver "$p")"
-    if [[ -z "$inst" ]]; then
-      suggest_pkgs="yes"
-      break
-    fi
-    if [[ -n "$inst" && -n "$cand" && "$cand" != "(none)" ]] && dpkg --compare-versions "$cand" gt "$inst" 2>/dev/null; then
-      suggest_pkgs="yes"
-      break
-    fi
-  done
-
-  if ! have_cmd docker; then
-    suggest_docker="yes"
+  if [[ "$DID_APT_UPDATE" != "yes" ]]; then
+    echo "  - Индексы пакетов могли быть неактуальны: запусти обновление системы или apt update (в продвинутом меню)."
+  fi
+  if [[ "$DID_SYS_UPGRADE" != "yes" ]]; then
+    echo "  - Система ещё не обновлялась в этой сессии (пункт обновления системы)."
   fi
 
   if have_cmd docker-compose; then
     local hp; hp="$(command -v docker-compose)"
     if [[ "$hp" == "/usr/local/bin/docker-compose" ]]; then
-      suggest_wrap="yes"
+      echo "  - Найден ручной docker-compose (/usr/local/bin): можно включить обёртку через пункт Docker."
     fi
-  fi
-
-  echo "  - Пункт 2 (обновление системы): опционально, если хочешь обновить ВСЮ систему."
-  if [[ "$suggest_pkgs" == "yes" ]]; then
-    echo "  - Пункт 3 (базовые пакеты): рекомендуется (есть missing/upgradable)."
-  else
-    echo "  - Пункт 3 (базовые пакеты): похоже, всё ок."
-  fi
-
-  if [[ "$suggest_docker" == "yes" ]]; then
-    echo "  - Пункт 4 (Docker): Docker не найден — установи Docker CE, если нужен."
-  else
-    echo "  - Пункт 4 (Docker): Docker найден."
-  fi
-
-  if [[ "$suggest_wrap" == "yes" ]]; then
-    echo "  - Пункт 4 → обёртка compose: рекомендуется (есть /usr/local/bin/docker-compose)."
   fi
   echo
 }
 
-# ---------- Menu action 1 ----------
 action_1_audit_everything() {
   show_command_audit
   show_docker_details
@@ -391,21 +354,38 @@ action_1_audit_everything() {
   show_action_plan
 }
 
-# ---------- Menu action 2 ----------
-update_system() {
+# ========= System update actions =========
+count_upgradable() {
+  # returns integer count (best-effort). requires updated lists for accuracy.
+  apt list --upgradable 2>/dev/null | awk 'NR>1{c++} END{print c+0}'
+}
+
+novice_update_system() {
   is_apt_os || { err "Не apt-система. Обновление не поддерживается."; return; }
   need_root_or_warn || return
 
   echo
-  log "Обновление системы (apt update/upgrade/full-upgrade/autoremove)."
+  log "Обновление системы (режим новичка)."
+  echo "Сценарий: apt update → показать количество обновлений → подтверждение → upgrade + full-upgrade + autoremove"
   warn "Это может обновить многие пакеты системы."
-  if ! confirm "Запустить обновление системы?"; then
+
+  if ! confirm "Продолжить?"; then
     log "Отменено."
     return
   fi
 
   log "apt-get update..."
   apt-get update -y
+  DID_APT_UPDATE="yes"
+
+  local n
+  n="$(count_upgradable || echo 0)"
+  log "Доступно обновлений (примерно): $n"
+
+  if ! confirm "Установить обновления сейчас?"; then
+    log "Ок, индексы обновлены, но пакеты не обновлялись."
+    return
+  fi
 
   log "apt-get upgrade..."
   apt-get upgrade -y
@@ -416,6 +396,8 @@ update_system() {
   log "apt-get autoremove..."
   apt-get autoremove -y
 
+  DID_SYS_UPGRADE="yes"
+
   if [[ -f /var/run/reboot-required ]]; then
     warn "Рекомендуется перезагрузка: найден /var/run/reboot-required"
   fi
@@ -423,7 +405,59 @@ update_system() {
   log "Готово."
 }
 
-# ---------- Menu action 3 ----------
+advanced_update_menu() {
+  is_apt_os || { err "Не apt-система. Обновление не поддерживается."; return; }
+  need_root_or_warn || return
+
+  while true; do
+    echo
+    echo "------------------------------"
+    echo " Advanced: System Update Menu"
+    echo "------------------------------"
+    echo "1) apt update (обновить индексы)"
+    echo "2) показать upgradable (apt list --upgradable)"
+    echo "3) симуляция upgrade (apt-get -s upgrade)"
+    echo "4) выполнить upgrade (apt-get upgrade)"
+    echo "5) симуляция full-upgrade (apt-get -s full-upgrade)"
+    echo "6) выполнить full-upgrade (apt-get full-upgrade)"
+    echo "7) autoremove (apt-get autoremove)"
+    echo "0) назад"
+    echo
+    read -r -p "Выбери (0-7): " ch
+    case "$ch" in
+      1)
+        apt-get update -y
+        DID_APT_UPDATE="yes"
+        ;;
+      2)
+        apt list --upgradable 2>/dev/null | sed 's/^/  /' || true
+        ;;
+      3)
+        apt-get -s upgrade | sed 's/^/  /' || true
+        ;;
+      4)
+        warn "upgrade обновляет пакеты без удаления/замены сложных зависимостей."
+        confirm "Выполнить apt-get upgrade?" && apt-get upgrade -y || true
+        DID_SYS_UPGRADE="yes"
+        ;;
+      5)
+        apt-get -s full-upgrade | sed 's/^/  /' || true
+        ;;
+      6)
+        warn "full-upgrade может устанавливать/удалять пакеты ради согласованности зависимостей."
+        confirm "Выполнить apt-get full-upgrade?" && apt-get full-upgrade -y || true
+        DID_SYS_UPGRADE="yes"
+        ;;
+      7)
+        confirm "Выполнить apt-get autoremove?" && apt-get autoremove -y || true
+        ;;
+      0) return ;;
+      *) warn "Неверный выбор." ;;
+    esac
+  done
+}
+
+# ========= Packages install =========
 install_or_upgrade_base_pkgs() {
   is_apt_os || { err "Не apt-система. Установка пакетов не поддерживается."; return; }
   need_root_or_warn || return
@@ -431,17 +465,23 @@ install_or_upgrade_base_pkgs() {
   echo
   log "Установка/обновление базовых пакетов:"
   echo "  ${BASE_PKGS[*]}"
+  if [[ "$USER_MODE" == "novice" && "$DID_SYS_UPGRADE" != "yes" ]]; then
+    warn "Подсказка: обычно сначала делают обновление системы, потом ставят пакеты."
+  fi
+
   if ! confirm "Продолжить установку/обновление?"; then
     log "Отменено."
     return
   fi
 
   apt-get update -y
+  DID_APT_UPDATE="yes"
+
   apt-get install -y "${BASE_PKGS[@]}"
   log "Готово."
 }
 
-# ---------- Docker install ----------
+# ========= Docker install =========
 docker_ce_installed() { dpkg -s docker-ce >/dev/null 2>&1; }
 
 ensure_docker_repo() {
@@ -465,6 +505,7 @@ deb [arch=${arch} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docke
 EOF
 
   apt-get update -y
+  DID_APT_UPDATE="yes"
 }
 
 wrap_docker_compose() {
@@ -506,10 +547,12 @@ install_docker_menu() {
   echo
   log "Установка Docker CE из официального репозитория Docker."
   warn "Если сейчас стоят docker.io/containerd/runc из репозиториев Ubuntu/Debian — возможны конфликты. Скрипт удалит конфликтующие пакеты."
+
   if docker_ce_installed; then
     log "docker-ce уже установлен."
     if confirm "Обновить docker-ce и плагины до доступных версий?"; then
       apt-get update -y
+      DID_APT_UPDATE="yes"
       apt-get install -y --only-upgrade docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || true
       log "Обновление Docker выполнено."
     fi
@@ -539,27 +582,55 @@ install_docker_menu() {
   esac
 }
 
-# ---------- Main menu ----------
+# ========= Mode chooser =========
+choose_user_mode() {
+  echo
+  echo "Выбери режим:"
+  echo "1) Новичок (простые действия, безопасные подсказки)"
+  echo "2) Продвинутый (больше контроля над обновлениями)"
+  echo
+  read -r -p "Режим (1-2) [1]: " m
+  case "${m:-1}" in
+    2) USER_MODE="advanced" ;;
+    *) USER_MODE="novice" ;;
+  esac
+}
+
+# ========= Main menu =========
 menu_loop() {
   while true; do
     echo
     echo "=============================="
     echo " VPS Bootstrap Menu"
+    echo " Mode: $USER_MODE"
     echo "=============================="
     echo "1) Аудит: команды/версии + Docker + пакетный аудит + план действий"
-    echo "2) Обновить систему (apt update/upgrade/full-upgrade)"
+    if [[ "$USER_MODE" == "novice" ]]; then
+      echo "2) Обновить систему (рекомендуется первым шагом)"
+    else
+      echo "2) Обновление системы (advanced submenu: update/upgrade/full-upgrade)"
+    fi
     echo "3) Установить/обновить базовые команды (пакеты)"
     echo "4) Установить/обновить Docker CE (+ опция обёртки compose)"
-    echo "5) Выход"
+    echo "5) Переключить режим (новичок/продвинутый)"
+    echo "6) Выход"
     echo
-    read -r -p "Выбери пункт (1-5): " choice
+    read -r -p "Выбери пункт (1-6): " choice
 
     case "$choice" in
       1) action_1_audit_everything; pause ;;
-      2) update_system; pause ;;
+      2)
+        if [[ "$USER_MODE" == "novice" ]]; then
+          novice_update_system
+        else
+          advanced_update_menu
+        fi
+        pause
+        ;;
       3) install_or_upgrade_base_pkgs; pause ;;
       4) install_docker_menu; pause ;;
-      5) clear; exit 0 ;;
+      5) choose_user_mode; clear; show_system_info ;;
+      6) clear; exit 0 ;;
       *) warn "Неверный выбор."; pause ;;
     esac
   done
@@ -567,6 +638,8 @@ menu_loop() {
 
 main() {
   detect_os
+  clear
+  choose_user_mode
   clear
   show_system_info
   menu_loop
