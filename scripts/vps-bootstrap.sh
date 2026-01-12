@@ -195,7 +195,7 @@ show_package_audit() {
       ((cnt_missing+=1)); missing_list+=("$p")
     elif [[ -z "$cand" || "$cand" == "(none)" ]]; then
       status="NO-CANDIDATE"
-      ((cnt_noc++=1)
+      ((cnt_noc+=1))
     elif ver_newer_available "$inst" "$cand"; then
       status="UPGRADABLE"
       ((cnt_upg+=1)); upg_list+=("$p")
@@ -210,9 +210,6 @@ show_package_audit() {
 
   echo
   log "Сводка пакетов: OK=${cnt_ok}, UPGRADABLE=${cnt_upg}, MISSING=${cnt_missing}, HELD=${cnt_held}, NO-CANDIDATE=${cnt_noc}"
-
-  # Save for "plan" (global via echo + export-like approach not needed; we'll compute plan separately below)
-  # But we can print compact helpful hints:
   if ((cnt_missing > 0)); then
     echo "  - Не установлены: ${missing_list[*]}"
   fi
@@ -253,7 +250,7 @@ show_command_audit() {
       [[ -z "$v" ]] && v="(version n/a)"
       printf "  %-16s %-8b %-28s %s\n" "$c" "$(color_status_cmd FOUND)" "$p" "$v"
     else
-      ((cnt_missing+-1))
+      ((cnt_missing+=1))
       missing_cmds+=("$c")
       printf "  %-16s %-8b %-28s %s\n" "$c" "$(color_status_cmd MISSING)" "-" "-"
     fi
@@ -330,40 +327,33 @@ show_docker_details() {
   echo
 }
 
-# ---------- Plan builder (compact, actionable) ----------
+# ---------- Plan builder ----------
 show_action_plan() {
-  # This is heuristic: based on visible facts, suggest which menu items to run.
   echo
   log "План действий (подсказки):"
 
-  local suggest_update="no"
   local suggest_pkgs="no"
   local suggest_docker="no"
   local suggest_wrap="no"
 
-  # If any base package missing or upgradable: suggest пункт 3.
-  # We'll compute quickly here without storing from audit: recompute lightweight.
   local p inst cand
   for p in "${BASE_PKGS[@]}"; do
     inst="$(installed_ver "$p")"
     cand="$(candidate_ver "$p")"
-    if [[ -z "$inst" ]]; then suggest_pkgs="yes"; break; fi
+    if [[ -z "$inst" ]]; then
+      suggest_pkgs="yes"
+      break
+    fi
     if [[ -n "$inst" && -n "$cand" && "$cand" != "(none)" ]] && dpkg --compare-versions "$cand" gt "$inst" 2>/dev/null; then
-      suggest_pkgs="yes"; break
+      suggest_pkgs="yes"
+      break
     fi
   done
 
-  # System update suggestion is intentionally conservative: only if user wants system-wide upgrade.
-  # We'll suggest if script runs as root and apt lists are probably stale? Not reliable.
-  # So we phrase it as optional.
-  suggest_update="optional"
-
-  # Docker suggestion:
   if ! have_cmd docker; then
     suggest_docker="yes"
   fi
 
-  # Wrap suggestion:
   if have_cmd docker-compose; then
     local hp; hp="$(command -v docker-compose)"
     if [[ "$hp" == "/usr/local/bin/docker-compose" ]]; then
@@ -371,19 +361,19 @@ show_action_plan() {
     fi
   fi
 
-  if [[ "$suggest_update" == "optional" ]]; then
-    echo "  - Пункт 2 (обновление системы): опционально, если хочешь обновить ВСЮ систему."
-  fi
+  echo "  - Пункт 2 (обновление системы): опционально, если хочешь обновить ВСЮ систему."
   if [[ "$suggest_pkgs" == "yes" ]]; then
-    echo "  - Пункт 3 (базовые пакеты): рекомендуется (есть missing/upgradable в списке базовых пакетов)."
+    echo "  - Пункт 3 (базовые пакеты): рекомендуется (есть missing/upgradable)."
   else
-    echo "  - Пункт 3 (базовые пакеты): похоже, всё ок (по списку базовых пакетов)."
+    echo "  - Пункт 3 (базовые пакеты): похоже, всё ок."
   fi
+
   if [[ "$suggest_docker" == "yes" ]]; then
     echo "  - Пункт 4 (Docker): Docker не найден — установи Docker CE, если нужен."
   else
     echo "  - Пункт 4 (Docker): Docker найден."
   fi
+
   if [[ "$suggest_wrap" == "yes" ]]; then
     echo "  - Пункт 4 → обёртка compose: рекомендуется (есть /usr/local/bin/docker-compose)."
   fi
