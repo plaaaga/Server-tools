@@ -189,18 +189,18 @@ show_package_audit() {
     status="OK"
     if [[ "${EUID}" -eq 0 ]] && is_held "$p"; then
       status="HELD"
-      ((cnt_held++)); held_list+=("$p")
+      ((cnt_held+=1)); held_list+=("$p")
     elif [[ -z "$inst" ]]; then
       status="MISSING"
-      ((cnt_missing++)); missing_list+=("$p")
+      ((cnt_missing+=1)); missing_list+=("$p")
     elif [[ -z "$cand" || "$cand" == "(none)" ]]; then
       status="NO-CANDIDATE"
-      ((cnt_noc++))
+      ((cnt_noc++=1)
     elif ver_newer_available "$inst" "$cand"; then
       status="UPGRADABLE"
-      ((cnt_upg++)); upg_list+=("$p")
+      ((cnt_upg+=1)); upg_list+=("$p")
     else
-      ((cnt_ok++))
+      ((cnt_ok+=1))
     fi
 
     [[ -z "$inst" ]] && inst="(none)"
@@ -247,13 +247,13 @@ show_command_audit() {
   local c p v
   for c in "${AUDIT_CMDS[@]}"; do
     if have_cmd "$c"; then
-      ((cnt_found++))
+      ((cnt_found+=1))
       p="$(cmd_path "$c")"
       v="$(cmd_version_line "$c")"
       [[ -z "$v" ]] && v="(version n/a)"
       printf "  %-16s %-8b %-28s %s\n" "$c" "$(color_status_cmd FOUND)" "$p" "$v"
     else
-      ((cnt_missing++))
+      ((cnt_missing+-1))
       missing_cmds+=("$c")
       printf "  %-16s %-8b %-28s %s\n" "$c" "$(color_status_cmd MISSING)" "-" "-"
     fi
